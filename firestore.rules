@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidProject(data) {
+      return data.id is string && data.id.size() <= 128
+        && data.name is string && data.name.size() <= 256
+        && data.createdAt is number
+        && data.updatedAt is number
+        && (!('status' in data) || (data.status is string && data.status.size() <= 100))
+        && (!('niche' in data) || (data.niche is string && data.niche.size() <= 100))
+        && (!('thumb' in data) || data.thumb == null || (data.thumb is string && data.thumb.size() <= 204800));
+    }
+
+    function isValidSettings(data) {
+      return data.id is string && data.id.size() <= 128
+        && data.updatedAt is number;
+    }
+
+    match /projects/{projectId} {
+      allow read: if true;
+      allow create, update: if isValidId(projectId) && isValidProject(request.resource.data);
+      allow delete: if isValidId(projectId);
+    }
+
+    match /settings/{settingsId} {
+      allow read: if true;
+      allow create, update: if isValidId(settingsId) && isValidSettings(request.resource.data);
+      allow delete: if isValidId(settingsId);
+    }
+
+    // Default deny for all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

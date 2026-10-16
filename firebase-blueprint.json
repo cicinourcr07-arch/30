@@ -1,0 +1,109 @@
+{
+  "entities": {
+    "Project": {
+      "title": "Project",
+      "description": "Studio video narrative project containing workflow stages, script, concepts, and timeline configuration",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for the project",
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "description": "Title or display name of the project",
+          "maxLength": 256
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Timestamp when the project was created"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Timestamp when the project was last updated"
+        },
+        "thumb": {
+          "type": "string",
+          "description": "Optional thumbnail image URL or base64 preview",
+          "maxLength": 204800
+        },
+        "durationSec": {
+          "type": "number",
+          "description": "Total estimated or calculated duration in seconds"
+        },
+        "clipCount": {
+          "type": "number",
+          "description": "Number of scenes or video clips"
+        },
+        "niche": {
+          "type": "string",
+          "description": "YouTube or content niche category",
+          "maxLength": 100
+        },
+        "currentStage": {
+          "type": "number",
+          "description": "Active workflow stage index from 1 to 7"
+        },
+        "progressPct": {
+          "type": "number",
+          "description": "Overall workflow completion percentage from 0 to 100"
+        },
+        "status": {
+          "type": "string",
+          "description": "Status string (Draft, Scripting, Visualizing, Ready, Exported)",
+          "maxLength": 50
+        },
+        "archived": {
+          "type": "boolean",
+          "description": "Whether the project has been archived"
+        },
+        "data": {
+          "type": "object",
+          "description": "Comprehensive serialized narrative state, scenes, visual prompts, and timeline edit data"
+        }
+      },
+      "required": ["id", "name", "createdAt", "updatedAt"]
+    },
+    "GlobalSettings": {
+      "title": "GlobalSettings",
+      "description": "Production presets, default channels, and studio workspace preferences",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Settings document ID, typically production_settings",
+          "maxLength": 64
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Timestamp when settings were last saved"
+        },
+        "channels": {
+          "type": "array",
+          "description": "List of configured YouTube studio channels and default styling"
+        },
+        "defaultChannelId": {
+          "type": "string",
+          "description": "Default active channel ID",
+          "maxLength": 64
+        },
+        "preferences": {
+          "type": "object",
+          "description": "App user interface and rendering preferences"
+        }
+      },
+      "required": ["id", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/projects/{projectId}": {
+      "schema": "Project",
+      "description": "Collection storing shared projects and video scripts accessible across devices"
+    },
+    "/settings/{settingsId}": {
+      "schema": "GlobalSettings",
+      "description": "Collection storing central studio configuration, channels, and presets"
+    }
+  }
+}

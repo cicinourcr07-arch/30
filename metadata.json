@@ -1,0 +1,6 @@
+{
+  "name": "AutoEditor - Video & Voiceover Sync Editor",
+  "description": "Universal YouTube Narrative Studio & Automated Video Editor — from YouTube reference analysis, 5 original concepts, scriptwriting, timed scene breakdown, and standalone visual/motion prompts to WebCodecs MP4 rendering and YouTube SEO.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
