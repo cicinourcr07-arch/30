@@ -9,6 +9,8 @@ import {
 } from "../lib/narrativeModel";
 import {
   fetchProviderStatus,
+  fetchAccountStatus,
+  syncAccountStatus,
   updateServerGeminiConfig,
   getStoredGeminiKeys,
   setStoredGeminiKeys,
@@ -135,14 +137,36 @@ export default function SettingsView({
   const [fetchingModels, setFetchingModels] = useState(false);
   const [fetchModelsNotice, setFetchModelsNotice] = useState(null);
   const [isCustomModel, setIsCustomModel] = useState(false);
+  const [keyPoolData, setKeyPoolData] = useState(null);
+  const [activeAccountData, setActiveAccountData] = useState(null);
+  const [syncingPool, setSyncingPool] = useState(false);
 
   const currentKeys = parseMultiKeysText(bulkKeysInput);
+
+  const loadAccountAndPool = async () => {
+    try {
+      const data = await fetchAccountStatus();
+      if (data?.ok) {
+        if (data.keyPool) setKeyPoolData(data.keyPool);
+        if (data.activeGoogleAccount) setActiveAccountData(data.activeGoogleAccount);
+        if (data.keyPool?.totalKeys) {
+          setProviderStatus((prev) => ({
+            ...prev,
+            geminiConfigured: true,
+            geminiKeyCount: data.keyPool.totalKeys,
+          }));
+        }
+      }
+    } catch {}
+  };
 
   useEffect(() => {
     const stored = getStoredGeminiKeys();
     fetchProviderStatus().then((st) => {
       if (st) {
         const count = Math.max(Number(st.geminiKeyCount) || 0, stored.length);
+        if (st.keyPool) setKeyPoolData(st.keyPool);
+        if (st.activeGoogleAccount) setActiveAccountData(st.activeGoogleAccount);
         setProviderStatus((prev) => ({
           ...prev,
           geminiConfigured: !!(st.geminiConfigured || count > 0),
@@ -151,13 +175,44 @@ export default function SettingsView({
       }
     });
 
+    loadAccountAndPool();
+    const interval = setInterval(loadAccountAndPool, 5000);
+
     // Auto-fetch available models in the background
     fetchAvailableGeminiModels().then((res) => {
       if (Array.isArray(res?.models) && res.models.length > 0) {
         setDiscoveredModels(res.models);
       }
     }).catch(() => {});
+
+    return () => clearInterval(interval);
   }, []);
+
+  const handleSyncAndResetCooldowns = async () => {
+    setSyncingPool(true);
+    try {
+      const res = await syncAccountStatus();
+      if (res?.ok) {
+        if (res.keyPool) setKeyPoolData(res.keyPool);
+        if (res.activeGoogleAccount) setActiveAccountData(res.activeGoogleAccount);
+        setProviderStatus((p) => ({
+          ...p,
+          testOk: true,
+          testMessage: isAr
+            ? "تمت إعادة ضبط فترات التهدئة ومزامنة جميع المفاتيح وحساب Google النشط بنجاح!"
+            : "Successfully reset key cooldowns and synchronized all Gemini API keys!",
+        }));
+      }
+    } catch (err) {
+      setProviderStatus((p) => ({
+        ...p,
+        testOk: false,
+        testMessage: err.message || String(err),
+      }));
+    } finally {
+      setSyncingPool(false);
+    }
+  };
 
   const handleFetchAvailableModels = async () => {
     setFetchingModels(true);
@@ -853,23 +908,128 @@ export default function SettingsView({
                 )}
               </span>
 
-              <button
-                type="button"
-                disabled={providerStatus.testing}
-                onClick={handleTestGeminiKeys}
-                className="uyns-btn uyns-btn--ghost uyns-btn--sm"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${providerStatus.testing ? "animate-spin" : ""}`} />
-                <span>
-                  {providerStatus.testing
-                    ? isAr
-                      ? "جاري فحص جميع المفاتيح..."
-                      : "Testing All Keys..."
-                    : isAr
-                    ? "فحص وحفظ جميع المفاتيح"
-                    : "Test & Verify All Keys"}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={syncingPool}
+                  onClick={handleSyncAndResetCooldowns}
+                  className="uyns-btn uyns-btn--ghost uyns-btn--sm"
+                  title={isAr ? "إلغاء فترات التهدئة ومزامنة جميع المفاتيح" : "Reset cooldowns and sync keys"}
+                >
+                  <RotateCcw className={`w-3.5 h-3.5 ${syncingPool ? "animate-spin" : ""}`} />
+                  <span>
+                    {syncingPool
+                      ? isAr
+                        ? "جاري المزامنة..."
+                        : "Syncing..."
+                      : isAr
+                      ? "تصفير التهدئة ومزامنة المفاتيح"
+                      : "Reset Cooldowns"}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={providerStatus.testing}
+                  onClick={handleTestGeminiKeys}
+                  className="uyns-btn uyns-btn--primary uyns-btn--sm"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${providerStatus.testing ? "animate-spin" : ""}`} />
+                  <span>
+                    {providerStatus.testing
+                      ? isAr
+                        ? "جاري فحص جميع المفاتيح..."
+                        : "Testing All Keys..."
+                      : isAr
+                      ? "فحص وحفظ جميع المفاتيح"
+                      : "Test & Verify All Keys"}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Multi-API Key Rotation & Resilience Live Dashboard */}
+          <div className="mt-3 p-4 rounded-xl bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-3">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="text-xs font-bold text-white">
+                  {isAr
+                    ? "نظام تدوير المفاتيح المتعددة والتعافي التلقائي (Multi-Key Rotation Pool)"
+                    : "Multi-API Key Rotation Pool & Auto-Failover"}
                 </span>
-              </button>
+              </div>
+              <span className="text-[11px] text-[var(--muted)]">
+                {isAr
+                  ? `الحساب: ${activeAccountData?.userEmail || "Google AI Studio Active Session"}`
+                  : `Account: ${activeAccountData?.userEmail || "Google AI Studio Active Session"}`}
+              </span>
+            </div>
+
+            {/* Metric Badges */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <div className="p-2.5 rounded-lg bg-[var(--panel-1)] border border-[var(--line-soft)] text-center">
+                <div className="text-[10px] text-[var(--muted)]">{isAr ? "إجمالي المفاتيح" : "Total Keys"}</div>
+                <div className="text-base font-bold text-white mt-0.5">
+                  {keyPoolData?.totalKeys || currentKeys.length || 1}
+                </div>
+              </div>
+              <div className="p-2.5 rounded-lg bg-[var(--panel-1)] border border-[var(--line-soft)] text-center">
+                <div className="text-[10px] text-[var(--muted)]">{isAr ? "مفاتيح جاهزة للعمل" : "Active & Ready"}</div>
+                <div className="text-base font-bold text-emerald-400 mt-0.5">
+                  {keyPoolData?.activeCount ?? currentKeys.length ?? 1}
+                </div>
+              </div>
+              <div className="p-2.5 rounded-lg bg-[var(--panel-1)] border border-[var(--line-soft)] text-center">
+                <div className="text-[10px] text-[var(--muted)]">{isAr ? "في فترة تهدئة (429)" : "In Cooldown (429)"}</div>
+                <div className={`text-base font-bold mt-0.5 ${keyPoolData?.cooldownCount ? "text-amber-400" : "text-[var(--muted)]"}`}>
+                  {keyPoolData?.cooldownCount ?? 0}
+                </div>
+              </div>
+              <div className="p-2.5 rounded-lg bg-[var(--panel-1)] border border-[var(--line-soft)] text-center">
+                <div className="text-[10px] text-[var(--muted)]">{isAr ? "المفتاح النشط حالياً" : "Current Active Key"}</div>
+                <div className="text-base font-bold text-[var(--accent)] mt-0.5">
+                  #{keyPoolData?.currentCursor || 1}
+                </div>
+              </div>
+            </div>
+
+            {/* Architecture Explanations Card */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px] text-[var(--muted)] pt-1">
+              <div className="p-2.5 rounded-lg bg-[var(--panel-1)]/60 border border-[var(--line-soft)]/50">
+                <div className="font-semibold text-white mb-1 flex items-center gap-1.5">
+                  <span className="w-4 h-4 rounded-full bg-[var(--accent)]/20 text-[var(--accent)] text-[10px] font-bold flex items-center justify-center">1</span>
+                  <span>{isAr ? "مصفوفة المفاتيح (Key Pool)" : "API Key Pool"}</span>
+                </div>
+                <p className="leading-relaxed">
+                  {isAr
+                    ? "يستقبل النظام مصفوفة مفاتيح عبر متغير البيئة GEMINI_API_KEYS أو إعدادات الواجهة مع حفظ مؤشر دائري (Round-Robin) لاختيار المفتاح النشط."
+                    : "Accepts a list of keys via GEMINI_API_KEYS or UI settings with a round-robin cursor for active key selection."}
+                </p>
+              </div>
+              <div className="p-2.5 rounded-lg bg-[var(--panel-1)]/60 border border-[var(--line-soft)]/50">
+                <div className="font-semibold text-white mb-1 flex items-center gap-1.5">
+                  <span className="w-4 h-4 rounded-full bg-amber-500/20 text-amber-400 text-[10px] font-bold flex items-center justify-center">2</span>
+                  <span>{isAr ? "التدوير الفوري والتهدئة (Failover)" : "Failover & Cooldown"}</span>
+                </div>
+                <p className="leading-relaxed">
+                  {isAr
+                    ? "عند حدوث خطأ نفاد الحصة (429 Quota Exhausted)، ينتقل تلقائياً وفوراً للمفتاح الموالي ويعيد المحاولة مع وضع المفتاح السابق في تهدئة مؤقتة (60s)."
+                    : "On quota limits (429 / Resource Exhausted), immediately rotates to next key and applies a temporary 60s cooldown."}
+                </p>
+              </div>
+              <div className="p-2.5 rounded-lg bg-[var(--panel-1)]/60 border border-[var(--line-soft)]/50">
+                <div className="font-semibold text-white mb-1 flex items-center gap-1.5">
+                  <span className="w-4 h-4 rounded-full bg-cyan-500/20 text-cyan-400 text-[10px] font-bold flex items-center justify-center">3</span>
+                  <span>{isAr ? "سلسلة النماذج (Model Cascade)" : "Model Fallback Cascade"}</span>
+                </div>
+                <p className="leading-relaxed">
+                  {isAr
+                    ? "إذا نفدت حصة جميع المفاتيح للنموذج الحالي، ينتقل النظام تلقائياً للنموذج التالي في السلسلة (Gemini 3.8 Flash → 3.1 Lite → Latest)."
+                    : "If all keys are exhausted for a model, the engine cascades seamlessly to the next compatible model in chain."}
+                </p>
+              </div>
             </div>
           </div>
 
@@ -1013,13 +1173,20 @@ export default function SettingsView({
             </div>
           </div>
 
-          {/* Individual Key Cards with Order & Status */}
+          {/* Individual Key Cards with Order & Live Pool Status */}
           {currentKeys.length > 0 && (
             <div className="mb-4 space-y-2">
-              <div className="text-xs font-semibold text-[var(--muted)]">
-                {isAr
-                  ? "ترتيب المفاتيح النشطة (الأولوية والتبديل التلقائي):"
-                  : "Active Key Pool Order (Priority & Auto-Failover):"}
+              <div className="flex items-center justify-between text-xs font-semibold text-[var(--muted)]">
+                <span>
+                  {isAr
+                    ? "ترتيب وحالة المفاتيح في المصفوفة (الأولوية ومؤشر التدوير):"
+                    : "Key Pool Priority & Active Rotation Status:"}
+                </span>
+                <span className="text-[11px] text-[var(--accent)]">
+                  {isAr
+                    ? `المفتاح النشط في الدور: #${keyPoolData?.currentCursor || 1}`
+                    : `Active in queue: #${keyPoolData?.currentCursor || 1}`}
+                </span>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {currentKeys.map((k, idx) => {
@@ -1027,23 +1194,59 @@ export default function SettingsView({
                     ? k
                     : `${k.slice(0, 8)}••••••••••••••••${k.slice(-4)}`;
                   const st = providerStatus.keyStatuses.find((s) => s.index === idx + 1);
+                  const poolKey = keyPoolData?.keys?.find((pk) => pk.index === idx + 1);
+                  const isCursor = (keyPoolData?.currentCursor || 1) === idx + 1;
+                  const inCooldown = poolKey?.inCooldown;
+
                   return (
                     <div
                       key={`${k.slice(0, 10)}_${idx}`}
-                      className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-[var(--panel-2)] border border-[var(--line-soft)] text-xs"
+                      className={`flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl text-xs transition-all ${
+                        isCursor
+                          ? "bg-[var(--accent)]/10 border-2 border-[var(--accent)] shadow-sm"
+                          : inCooldown
+                          ? "bg-amber-500/10 border border-amber-500/30"
+                          : "bg-[var(--panel-2)] border border-[var(--line-soft)]"
+                      }`}
                     >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="px-2 py-0.5 rounded-md bg-[var(--accent)]/15 text-[var(--accent)] font-bold shrink-0">
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                        <span
+                          className={`px-2 py-0.5 rounded-md font-bold shrink-0 ${
+                            isCursor
+                              ? "bg-[var(--accent)] text-white"
+                              : "bg-[var(--panel-1)] text-[var(--accent)]"
+                          }`}
+                        >
                           #{idx + 1}
                         </span>
                         <span className="font-mono truncate">{masked}</span>
-                        {st && (
+
+                        {isCursor && (
+                          <span className="px-1.5 py-0.5 rounded bg-[var(--accent)]/20 text-[var(--accent)] text-[10px] font-bold shrink-0">
+                            {isAr ? "⚡ النشط حالياً" : "Active Cursor"}
+                          </span>
+                        )}
+
+                        {inCooldown ? (
+                          <span className="text-[11px] font-semibold text-amber-400 shrink-0 flex items-center gap-1">
+                            <span>⏳</span>
+                            <span>
+                              {isAr
+                                ? `تهدئة (${poolKey.remainingCooldownSec} ث)`
+                                : `Cooldown (${poolKey.remainingCooldownSec}s)`}
+                            </span>
+                          </span>
+                        ) : st ? (
                           <span
                             className={`text-[11px] font-semibold shrink-0 ${
                               st.ok ? "text-emerald-400" : "text-red-400"
                             }`}
                           >
-                            {st.ok ? (isAr ? "يعمل" : "Active") : isAr ? "خطأ/حصة" : "Quota/Err"}
+                            {st.ok ? (isAr ? "يعمل ✓" : "Active ✓") : isAr ? "خطأ/حصة ✗" : "Quota/Err ✗"}
+                          </span>
+                        ) : (
+                          <span className="text-[11px] font-semibold text-emerald-400 shrink-0">
+                            {isAr ? "جاهز للعمل ✓" : "Ready ✓"}
                           </span>
                         )}
                       </div>

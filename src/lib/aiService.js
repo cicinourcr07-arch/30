@@ -118,12 +118,59 @@ async function postJson(endpoint, payload = {}) {
     }
     throw new Error(data.error || `Request to ${endpoint} failed with status ${res.status}`);
   }
+
+  // Notify frontend if Gemini automatically rotated keys or switched models due to quota limits
+  if (typeof window !== "undefined") {
+    if (data?._keySwitched) {
+      window.dispatchEvent(
+        new CustomEvent("gemini-key-switched", {
+          detail: {
+            usedKeyIndex: data._usedKeyIndex,
+            totalKeys: data._totalKeys,
+            usedKeyMasked: data._usedKeyMasked,
+            id: Date.now(),
+          },
+        })
+      );
+    }
+    if (data?._modelSwitched) {
+      window.dispatchEvent(
+        new CustomEvent("gemini-model-switched", {
+          detail: {
+            usedModel: data._usedModel,
+            initialModel: data._initialModel,
+            id: Date.now(),
+          },
+        })
+      );
+    }
+  }
   return data;
 }
 
 export async function fetchProviderStatus() {
   try {
     const res = await fetch("/api/providers/status");
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchAccountStatus() {
+  try {
+    const res = await fetch("/api/account/status");
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function syncAccountStatus() {
+  try {
+    const res = await fetch("/api/account/sync", { method: "POST" });
     if (!res.ok) return null;
     return await res.json();
   } catch {

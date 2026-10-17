@@ -241,10 +241,42 @@ function extractErrorDetails(err: any): {
   }
 }
 
-// Universal Self-Healing Gemini Multi-Key & Autonomous Model Cascade Engine
-// 1. Dynamic Active Google Account Connection (zero manual API key configuration required)
-// 2. Continuous Automatic Fallback across compatible Gemini models whenever quota (429) or capacity (503) is exhausted
-// 3. Multi-worker round-robin load distribution
+// Gemini API Keys Pool Status Inspector
+export function getGeminiKeysPoolStatus(reqBody?: any) {
+  const allKeys = resolveGeminiApiKeys(reqBody);
+  const now = Date.now();
+  const keys = allKeys.map((k, idx) => {
+    const cooldownUntil = failedKeyCooldownUntil.get(k) || 0;
+    const inCooldown = cooldownUntil > now;
+    const remainingCooldownSec = inCooldown ? Math.ceil((cooldownUntil - now) / 1000) : 0;
+    const masked = k.length > 10 ? `${k.slice(0, 6)}...${k.slice(-4)}` : "••••••••";
+    const activeReqs = activeRequestsPerKey.get(k) || 0;
+    return {
+      index: idx + 1,
+      masked,
+      inCooldown,
+      remainingCooldownSec,
+      activeRequests: activeReqs,
+    };
+  });
+
+  const activeCount = keys.filter((k) => !k.inCooldown).length;
+  const cooldownCount = keys.filter((k) => k.inCooldown).length;
+
+  return {
+    totalKeys: allKeys.length,
+    activeCount,
+    cooldownCount,
+    currentCursor: allKeys.length > 0 ? (Math.abs(geminiKeyCursor) % allKeys.length) + 1 : 1,
+    keys,
+  };
+}
+
+// Universal Self-Healing Gemini Multi-Key Rotation & Autonomous Model Cascade Engine
+// 1. Multi-API Key Rotation: Rotates across all healthy keys in the pool first upon quota limits (429 / RESOURCE_EXHAUSTED)
+// 2. Cooldown Protection: Puts rate-limited keys into temporary cooldown (60s) to avoid repeated fails
+// 3. Model Fallback Cascade: If ALL keys in the pool are exhausted for the active model, seamlessly cascades to the next compatible model
+// 4. Dynamic Active Google Account Connection (zero manual API key configuration required)
 async function executeGeminiWithFailover<T>(
   operation: (ai: GoogleGenAI, keyIndex: number, totalKeys: number, activeModel: string) => Promise<T>,
   reqBody?: any,
@@ -254,7 +286,7 @@ async function executeGeminiWithFailover<T>(
   const allKeys = resolveGeminiApiKeys(reqBody);
   if (allKeys.length === 0) {
     throw new Error(
-      "لم يتم العثور على مفتاح Gemini API النشط في المشروع. تأكد من تفعيل Gemini API لحساب Google المستخدم في Google AI Studio."
+      "لم يتم العثور على أي مفتاح Gemini API نشط. أضف مفتاحاً واحداً أو أكثر في إعدادات التطبيق أو عبر متغيرات البيئة GEMINI_API_KEYS."
     );
   }
 
@@ -269,11 +301,13 @@ async function executeGeminiWithFailover<T>(
   const modelsToAttempt = availableModels.length > 0 ? availableModels : modelChain;
 
   let lastError: any = null;
+  let keySwitched = false;
 
   for (let mIdx = 0; mIdx < modelsToAttempt.length; mIdx++) {
     const modelToTry = modelsToAttempt[mIdx];
     const isFallbackModel = modelToTry !== requestedModel;
 
+    // Pick keys that are currently not in cooldown, or all keys if all are cooling down
     const healthyKeys = allKeys.filter((k) => (failedKeyCooldownUntil.get(k) || 0) <= Date.now());
     const candidatePool = healthyKeys.length > 0 ? healthyKeys : allKeys;
 
@@ -302,27 +336,36 @@ async function executeGeminiWithFailover<T>(
     for (let attempt = 0; attempt < orderedKeys.length; attempt++) {
       const key = orderedKeys[attempt];
       const originalKeyNumber = allKeys.indexOf(key) + 1;
+      const maskedKey = key.length > 10 ? `${key.slice(0, 6)}...${key.slice(-4)}` : "••••";
       const ai = createGeminiClient(key);
 
       activeRequestsPerKey.set(key, (activeRequestsPerKey.get(key) || 0) + 1);
       try {
         const result = await operation(ai, originalKeyNumber - 1, allKeys.length, modelToTry);
         
-        // Success: clear quota cooldown for this model and key
+        // Success: clear cooldown for this key and model
         modelQuotaExhaustedUntil.delete(modelToTry);
         failedKeyCooldownUntil.delete(key);
 
         if (isFallbackModel) {
           console.log(
-            `[Gemini Auto-Switch SUCCESS] Successfully completed operation with fallback model '${modelToTry}' after quota exhaustion on '${requestedModel}'.`
+            `[Gemini Auto-Switch SUCCESS] Successfully completed operation with fallback model '${modelToTry}' using Key #${originalKeyNumber} (${maskedKey}).`
+          );
+        } else if (attempt > 0 || keySwitched) {
+          console.log(
+            `[Gemini Multi-Key SUCCESS] Successfully rotated and completed operation with Key #${originalKeyNumber}/${allKeys.length} (${maskedKey}) on model '${modelToTry}'.`
           );
         }
 
-        // Attach model telemetry to result if object
+        // Attach rich telemetry to result if object
         if (result && typeof result === "object") {
           (result as any)._usedModel = modelToTry;
           (result as any)._initialModel = requestedModel;
           (result as any)._modelSwitched = isFallbackModel;
+          (result as any)._usedKeyIndex = originalKeyNumber;
+          (result as any)._totalKeys = allKeys.length;
+          (result as any)._usedKeyMasked = maskedKey;
+          (result as any)._keySwitched = keySwitched || attempt > 0;
         }
 
         return result;
@@ -330,40 +373,58 @@ async function executeGeminiWithFailover<T>(
         lastError = err;
         const { isQuotaExhausted, isDemandSpike, isKeyAuthError, msg } = extractErrorDetails(err);
 
+        // 1. Quota Exhaustion (429, limit exceeded) on THIS specific key
         if (isQuotaExhausted) {
-          // Put this model in quota cooldown for 60 seconds
-          modelQuotaExhaustedUntil.set(modelToTry, Date.now() + 60_000);
-          const nextModel = modelsToAttempt[mIdx + 1] || "none";
-          console.warn(
-            `[Gemini Auto-Switch] Quota exhausted for model '${modelToTry}' (${msg}). Automatically switching immediately to next available model in chain: '${nextModel}'...`
-          );
-          modelExhaustedOrSpike = true;
-          // Break key attempt loop immediately to advance to the next compatible model!
-          break;
+          // Put this specific key into 60s cooldown
+          failedKeyCooldownUntil.set(key, Date.now() + 60_000);
+
+          if (attempt < orderedKeys.length - 1) {
+            keySwitched = true;
+            console.warn(
+              `[Gemini Key-Rotation] Quota exhausted on Key #${originalKeyNumber}/${allKeys.length} (${maskedKey}) for model '${modelToTry}'. Immediately rotating to next key in pool...`
+            );
+            continue; // TRY NEXT KEY ON SAME MODEL!
+          } else {
+            // All keys in the pool were tried and exhausted on this model!
+            modelQuotaExhaustedUntil.set(modelToTry, Date.now() + 60_000);
+            const nextModel = modelsToAttempt[mIdx + 1] || "none";
+            console.warn(
+              `[Gemini Auto-Model Cascade] All ${allKeys.length} API keys exhausted for model '${modelToTry}'. Cascading to next available model in chain: '${nextModel}'...`
+            );
+            modelExhaustedOrSpike = true;
+            break; // Break key loop to try next model in cascade!
+          }
         }
 
+        // 2. Capacity surge (503 / 504) or Model Not Found (404)
         if (isDemandSpike) {
           console.warn(
-            `[Gemini Auto-Resilience] Model '${modelToTry}' experienced capacity surge (503). Advancing immediately to next model in chain...`
+            `[Gemini Auto-Resilience] Model '${modelToTry}' capacity surge (503). Advancing immediately to next model in chain...`
           );
+          modelQuotaExhaustedUntil.set(modelToTry, Date.now() + 30_000);
           modelExhaustedOrSpike = true;
-          break;
+          break; // Model level issue, advance model!
         }
 
+        // 3. Invalid API key error (400 / PERMISSION_DENIED)
         if (isKeyAuthError) {
-          failedKeyCooldownUntil.set(key, Date.now() + 120_000);
+          console.warn(
+            `[Gemini Key Auth Warning] Key #${originalKeyNumber}/${allKeys.length} (${maskedKey}) invalid or unauthorized. Putting in 5min cooldown and failing over...`
+          );
+          failedKeyCooldownUntil.set(key, Date.now() + 300_000);
+          if (attempt < orderedKeys.length - 1) {
+            keySwitched = true;
+            continue;
+          }
         } else {
           failedKeyCooldownUntil.set(key, Date.now() + 30_000);
-        }
-
-        if (attempt < orderedKeys.length - 1) {
-          console.warn(
-            `[Gemini Multi-Key Failover] Key #${originalKeyNumber}/${allKeys.length} failed (${msg.slice(
-              0,
-              90
-            )}), failing over to next key...`
-          );
-          continue;
+          if (attempt < orderedKeys.length - 1) {
+            keySwitched = true;
+            console.warn(
+              `[Gemini Failover] Key #${originalKeyNumber}/${allKeys.length} transient error (${msg.slice(0, 90)}). Trying next key...`
+            );
+            continue;
+          }
         }
       } finally {
         const cur = activeRequestsPerKey.get(key) || 1;
@@ -371,13 +432,25 @@ async function executeGeminiWithFailover<T>(
       }
     }
 
-    // If quota was exhausted or capacity spiked, loop will now try next model in modelsToAttempt
     if (modelExhaustedOrSpike && mIdx < modelsToAttempt.length - 1) {
       continue;
     }
   }
 
-  throw lastError;
+  throw lastError || new Error("Gemini AI operation failed across all keys and fallback models.");
+}
+
+export function attachResponseTelemetry(target: any, rawResponse: any) {
+  if (!target || typeof target !== "object") return target;
+  if (!rawResponse || typeof rawResponse !== "object") return target;
+  target._usedModel = rawResponse._usedModel;
+  target._initialModel = rawResponse._initialModel;
+  target._modelSwitched = !!rawResponse._modelSwitched;
+  target._usedKeyIndex = rawResponse._usedKeyIndex;
+  target._totalKeys = rawResponse._totalKeys;
+  target._usedKeyMasked = rawResponse._usedKeyMasked;
+  target._keySwitched = !!rawResponse._keySwitched;
+  return target;
 }
 
 // External / Custom API (OpenAI-Compatible: OpenAI, DeepSeek, OpenRouter, Groq, Ollama, etc.)
@@ -604,6 +677,7 @@ app.get("/api/account/status", (_req, res) => {
   const geminiKeys = resolveGeminiApiKeys();
   const accountInfo = getActiveGoogleAccountInfo();
   const fallbackChain = getModelFallbackChain("gemini-3.8-flash");
+  const keyPool = getGeminiKeysPoolStatus();
   const now = Date.now();
   const exhaustedModels = Array.from(modelQuotaExhaustedUntil.entries())
     .filter(([_, until]) => until > now)
@@ -616,6 +690,7 @@ app.get("/api/account/status", (_req, res) => {
       keyCount: geminiKeys.length,
       isConfigured: geminiKeys.length > 0,
     },
+    keyPool,
     autoModelSwitching: {
       enabled: true,
       currentTextModel: runtimeGeminiConfig.textModel,
@@ -633,21 +708,24 @@ app.post("/api/account/sync", (_req, res) => {
   failedKeyCooldownUntil.clear();
   const geminiKeys = resolveGeminiApiKeys();
   const accountInfo = getActiveGoogleAccountInfo();
+  const keyPool = getGeminiKeysPoolStatus();
 
   res.json({
     ok: true,
-    message: "تم تحديث ومزامنة بيانات حساب Google النشط وإعادة ضبط حصص النماذج بنجاح.",
+    message: "تم تحديث ومزامنة بيانات حساب Google النشط وإعادة ضبط مؤشرات وحصص جميع المفاتيح بنجاح.",
     activeGoogleAccount: {
       ...accountInfo,
       keyCount: geminiKeys.length,
       isConfigured: geminiKeys.length > 0,
     },
+    keyPool,
   });
 });
 
 app.get("/api/providers/status", (_req, res) => {
   const geminiKeys = resolveGeminiApiKeys();
   const accountInfo = getActiveGoogleAccountInfo();
+  const keyPool = getGeminiKeysPoolStatus();
   const now = Date.now();
   const exhaustedModels = Array.from(modelQuotaExhaustedUntil.entries())
     .filter(([_, until]) => until > now)
@@ -657,6 +735,7 @@ app.get("/api/providers/status", (_req, res) => {
     geminiConfigured: geminiKeys.length > 0,
     geminiKeyCount: geminiKeys.length,
     youtubeApiConfigured: !!process.env.YOUTUBE_API_KEY,
+    keyPool,
     activeGoogleAccount: {
       ...accountInfo,
       keyCount: geminiKeys.length,
@@ -1461,11 +1540,7 @@ ${effectiveNiche ? `- ALL 5 concepts MUST strictly belong to the specified chann
     );
 
     const parsed = parseJsonClean(response.text || "{}");
-    if (parsed && typeof parsed === "object") {
-      parsed._usedModel = (response as any)._usedModel;
-      parsed._initialModel = (response as any)._initialModel;
-      parsed._modelSwitched = (response as any)._modelSwitched;
-    }
+    attachResponseTelemetry(parsed, response);
     res.json(parsed);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "AI reference analysis failed." });
@@ -1563,11 +1638,7 @@ Return strictly JSON with key "concepts" (array of 5 objects with id, title, pre
       req.body
     );
     const parsed = parseJsonClean(response.text || "{}");
-    if (parsed && typeof parsed === "object") {
-      parsed._usedModel = (response as any)._usedModel;
-      parsed._initialModel = (response as any)._initialModel;
-      parsed._modelSwitched = (response as any)._modelSwitched;
-    }
+    attachResponseTelemetry(parsed, response);
     res.json(parsed);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to regenerate concepts." });
@@ -1744,12 +1815,9 @@ STRICT RULES:
     );
 
     const cleaned = cleanVoiceoverScriptOnly(response.text || "");
-    res.json({
-      script: cleaned,
-      _usedModel: (response as any)._usedModel,
-      _initialModel: (response as any)._initialModel,
-      _modelSwitched: (response as any)._modelSwitched,
-    });
+    const resultObj = { script: cleaned };
+    attachResponseTelemetry(resultObj, response);
+    res.json(resultObj);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Script generation failed." });
   }
@@ -1847,7 +1915,7 @@ app.post("/api/ai/generate-tts", async (req, res) => {
     if (!base64Audio) {
       throw new Error("TTS model did not return audio data.");
     }
-    res.json({
+    const ttsResult = {
       audioBase64: base64Audio,
       audioDataUrl: `data:audio/wav;base64,${base64Audio}`,
       mimeType: "audio/wav",
@@ -1855,7 +1923,9 @@ app.post("/api/ai/generate-tts", async (req, res) => {
       providerUsed: "gemini",
       modelUsed: (response as any)._usedModel || "gemini-3.8-flash-lite-tts",
       modelSwitched: (response as any)._modelSwitched || false,
-    });
+    };
+    attachResponseTelemetry(ttsResult, response);
+    res.json(ttsResult);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Voice-over generation failed." });
   }
@@ -1954,14 +2024,16 @@ app.post("/api/ai/generate-scene-image", async (req, res) => {
     for (const part of parts) {
       if (part.inlineData?.data) {
         const mime = part.inlineData.mimeType || "image/png";
-        return res.json({
+        const imgResult = {
           imageBase64: part.inlineData.data,
           imageDataUrl: `data:${mime};base64,${part.inlineData.data}`,
           mimeType: mime,
           providerUsed: "gemini",
           modelUsed: (response as any)._usedModel || "gemini-3.1-flash-lite-image",
           modelSwitched: (response as any)._modelSwitched || false,
-        });
+        };
+        attachResponseTelemetry(imgResult, response);
+        return res.json(imgResult);
       }
     }
     throw new Error("Image model did not return an inline image.");
@@ -2193,12 +2265,9 @@ CRITICAL DYNAMIC TIMING & CONTINUITY RULES:
       };
     });
 
-    res.json({
-      scenes: timedScenes,
-      _usedModel: geminiResponse?._usedModel,
-      _initialModel: geminiResponse?._initialModel,
-      _modelSwitched: geminiResponse?._modelSwitched,
-    });
+    const breakdownResult = { scenes: timedScenes };
+    attachResponseTelemetry(breakdownResult, geminiResponse);
+    res.json(breakdownResult);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Scene breakdown failed." });
   }
@@ -2420,6 +2489,10 @@ You MUST replicate and incorporate these exact visual characteristics into EVERY
             _usedModel: (response as any)._usedModel,
             _initialModel: (response as any)._initialModel,
             _modelSwitched: (response as any)._modelSwitched,
+            _usedKeyIndex: (response as any)._usedKeyIndex,
+            _totalKeys: (response as any)._totalKeys,
+            _usedKeyMasked: (response as any)._usedKeyMasked,
+            _keySwitched: (response as any)._keySwitched,
           };
         })
       );
@@ -2478,11 +2551,13 @@ You MUST replicate and incorporate these exact visual characteristics into EVERY
       };
     });
 
+    const anyKeySwitched = (rawPrompts as any[]).some?.((c: any) => c?._keySwitched) || false;
     res.json({
       prompts: finalPrompts,
       _usedModel: effectiveUsedModel,
       _initialModel: effectiveInitialModel,
       _modelSwitched: anySwitched,
+      _keySwitched: anyKeySwitched,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to generate image prompts." });
@@ -2591,12 +2666,9 @@ Image Prompt: ${ip?.prompt || s.visualDescription}`;
       };
     });
 
-    res.json({
-      motionPrompts: finalMotions,
-      _usedModel: geminiResponse?._usedModel,
-      _initialModel: geminiResponse?._initialModel,
-      _modelSwitched: geminiResponse?._modelSwitched,
-    });
+    const motionResult = { motionPrompts: finalMotions };
+    attachResponseTelemetry(motionResult, geminiResponse);
+    res.json(motionResult);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to generate motion prompts." });
   }
@@ -2940,11 +3012,7 @@ You MUST replicate and incorporate these exact visual characteristics into all 3
     );
 
     const parsed = sanitizeSeoPackage(parseJsonClean(response.text || "{}"), channelProfile?.niche || niche, projectName, language);
-    if (parsed && typeof parsed === "object") {
-      parsed._usedModel = (response as any)._usedModel;
-      parsed._initialModel = (response as any)._initialModel;
-      parsed._modelSwitched = (response as any)._modelSwitched;
-    }
+    attachResponseTelemetry(parsed, response);
     res.json(parsed);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to generate YouTube SEO package." });
@@ -2998,12 +3066,11 @@ Return strictly valid JSON with key: "titles" (array of 5 strings).`;
       req.body
     );
     const parsed = parseJsonClean(response.text || "{}");
-    res.json({
+    const resultObj = {
       titles: Array.isArray(parsed?.titles) ? parsed.titles.slice(0, 5) : [],
-      _usedModel: (response as any)._usedModel,
-      _initialModel: (response as any)._initialModel,
-      _modelSwitched: (response as any)._modelSwitched,
-    });
+    };
+    attachResponseTelemetry(resultObj, response);
+    res.json(resultObj);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to regenerate titles." });
   }
@@ -3082,13 +3149,12 @@ Return strictly valid JSON with keys: "description" (string) and "chapters" (arr
       req.body
     );
     const parsed = parseJsonClean(response.text || "{}");
-    res.json({
+    const resultObj = {
       description: parsed?.description || "",
       chapters: parsed?.chapters || [],
-      _usedModel: (response as any)._usedModel,
-      _initialModel: (response as any)._initialModel,
-      _modelSwitched: (response as any)._modelSwitched,
-    });
+    };
+    attachResponseTelemetry(resultObj, response);
+    res.json(resultObj);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to regenerate description." });
   }
@@ -3151,7 +3217,12 @@ Return strictly valid JSON with keys: "hashtags" (array of exactly 15 strings st
     );
     const parsed = parseJsonClean(response.text || "{}");
     const hashtags = sanitizeHashtags(parsed?.hashtags, niche, projectName, language);
-    res.json({ hashtags, tags: Array.isArray(parsed?.tags) ? parsed.tags : [] });
+    const resultObj = {
+      hashtags,
+      tags: Array.isArray(parsed?.tags) ? parsed.tags : [],
+    };
+    attachResponseTelemetry(resultObj, response);
+    res.json(resultObj);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to regenerate hashtags." });
   }
@@ -3245,7 +3316,9 @@ Return strictly valid JSON with key: "thumbnails" (array of 3 objects with {id, 
       ...th,
       visualPrompt: ensureOverlayTextInPrompt(th?.visualPrompt, th?.suggestedText),
     }));
-    res.json({ thumbnails: sanitized });
+    const resultObj = { thumbnails: sanitized };
+    attachResponseTelemetry(resultObj, response);
+    res.json(resultObj);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to regenerate thumbnail prompts." });
   }

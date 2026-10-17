@@ -1,5 +1,5 @@
 "use client";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   WORKFLOW_STAGES,
   SUPPORTED_VOICES,
@@ -56,6 +56,7 @@ import {
   Tv,
   RotateCcw,
   RotateCw,
+  KeyRound,
 } from "lucide-react";
 
 export default function NarrativeWorkspace({
@@ -111,6 +112,43 @@ export default function NarrativeWorkspace({
   const [selectedSceneIdx, setSelectedSceneIdx] = useState(0);
   const [copiedId, setCopiedId] = useState(null);
   const [showInlineChannels, setShowInlineChannels] = useState(false);
+  const [failoverNotice, setFailoverNotice] = useState(null);
+
+  useEffect(() => {
+    let timer = null;
+    const handleKeySwitched = (e) => {
+      const { usedKeyIndex, totalKeys, usedKeyMasked } = e.detail || {};
+      setFailoverNotice({
+        type: "key",
+        message: isAr
+          ? `🔄 تم تدوير المفتاح تلقائياً: تم استهلاك حصة المفتاح السابق والانتقال فوراً للمفتاح #${usedKeyIndex} من أصل ${totalKeys} (${usedKeyMasked}) بنجاح دون مقاطعة.`
+          : `🔄 Automatic Key Failover: Rate limit reached on previous key, seamlessly rotated to Key #${usedKeyIndex}/${totalKeys} (${usedKeyMasked}).`,
+      });
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setFailoverNotice(null), 9000);
+    };
+
+    const handleModelSwitched = (e) => {
+      const { usedModel } = e.detail || {};
+      setFailoverNotice({
+        type: "model",
+        message: isAr
+          ? `⚡ تم تبديل الموديل تلقائياً: نفدت حصة الموديل الحالي، تم التحويل فوراً إلى '${usedModel}' لمواصلة المعالجة بنجاح.`
+          : `⚡ Automatic Model Cascade: Quota exhausted, seamlessly cascaded to '${usedModel}' to continue processing.`,
+      });
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setFailoverNotice(null), 9000);
+    };
+
+    window.addEventListener("gemini-key-switched", handleKeySwitched);
+    window.addEventListener("gemini-model-switched", handleModelSwitched);
+
+    return () => {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener("gemini-key-switched", handleKeySwitched);
+      window.removeEventListener("gemini-model-switched", handleModelSwitched);
+    };
+  }, [isAr]);
 
   const activeAiProvider =
     globalSettings?.aiSettings?.activeProvider ||
@@ -1198,6 +1236,18 @@ export default function NarrativeWorkspace({
               <span>{isAr ? "السيو (SEO)" : "SEO Package"}</span>
             </button>
 
+            {openSettingsFromWorkspace && (
+              <button
+                type="button"
+                onClick={openSettingsFromWorkspace}
+                className="uyns-top-pill text-emerald-400 border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20"
+                title={isAr ? "نظام تدوير المفاتيح المتعددة والتعافي التلقائي مفعل" : "Multi-API Key Rotation & Auto-Failover Active"}
+              >
+                <KeyRound className="w-3.5 h-3.5" />
+                <span>{isAr ? "تدوير المفاتيح ⚡" : "Key Rotation ⚡"}</span>
+              </button>
+            )}
+
             {setTheme && (
               <button
                 type="button"
@@ -1272,6 +1322,23 @@ export default function NarrativeWorkspace({
                 </button>
               )}
             <button type="button" onClick={() => setStageError(null)} className="text-xs underline">
+              {isAr ? "إغلاق" : "Dismiss"}
+            </button>
+          </div>
+        )}
+
+        {/* Live Multi-Key Failover & Model Switch Notification */}
+        {failoverNotice && (
+          <div className="mx-6 mt-4 p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-200 text-xs flex items-center justify-between gap-3 shadow-lg animate-fadeIn">
+            <div className="flex items-center gap-2.5">
+              <Sparkles className="w-4 h-4 text-cyan-400 shrink-0 animate-pulse" />
+              <span className="font-medium leading-relaxed">{failoverNotice.message}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setFailoverNotice(null)}
+              className="text-xs text-[var(--muted)] hover:text-white px-2 py-1 rounded bg-[var(--panel-1)] shrink-0"
+            >
               {isAr ? "إغلاق" : "Dismiss"}
             </button>
           </div>
