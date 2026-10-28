@@ -374,6 +374,8 @@ export async function syncMedia(projectId, wanted) {
 // ---- global production settings --------------------------------------------
 
 export async function getGlobalSettings() {
+  let settings = null;
+
   // 1. Try remote Firebase Firestore database
   if (db) {
     try {
@@ -381,8 +383,9 @@ export async function getGlobalSettings() {
       const snap = await getDoc(docRef);
       if (snap.exists()) {
         const data = snap.data();
-        tx(STORE_SETTINGS, "readwrite", (s) => reqP(s.put(data, "production_settings"))).catch(() => {});
-        return data;
+        if (data && Array.isArray(data.channels) && data.channels.length > 0) {
+          settings = data;
+        }
       }
     } catch (err) {
       console.warn("[Firebase Firestore] Error reading settings:", err?.message || err);
@@ -390,20 +393,36 @@ export async function getGlobalSettings() {
   }
 
   // 2. Try remote Cloud SQL
-  try {
-    const remote = await fetchApi("/api/db/settings");
-    if (remote && typeof remote === "object" && Object.keys(remote).length > 0) {
-      tx(STORE_SETTINGS, "readwrite", (s) => reqP(s.put(remote, "production_settings"))).catch(() => {});
-      return remote;
-    }
-  } catch (_) {}
-
-  // 3. Local fallback
-  try {
-    return await tx(STORE_SETTINGS, "readonly", (s) => reqP(s.get("production_settings")));
-  } catch (_) {
-    return null;
+  if (!settings || !Array.isArray(settings.channels) || settings.channels.length === 0) {
+    try {
+      const remote = await fetchApi("/api/db/settings");
+      if (remote && typeof remote === "object" && Array.isArray(remote.channels) && remote.channels.length > 0) {
+        settings = remote;
+      }
+    } catch (_) {}
   }
+
+  // 3. Local IndexedDB fallback
+  if (!settings || !Array.isArray(settings.channels) || settings.channels.length === 0) {
+    try {
+      const local = await tx(STORE_SETTINGS, "readonly", (s) => reqP(s.get("production_settings")));
+      if (local && Array.isArray(local.channels) && local.channels.length > 0) {
+        settings = local;
+      }
+    } catch (_) {}
+  }
+
+  // 4. If settings was found, cache in IndexedDB and Firestore
+  if (settings) {
+    tx(STORE_SETTINGS, "readwrite", (s) => reqP(s.put(settings, "production_settings"))).catch(() => {});
+    if (db) {
+      const docRef = doc(db, "settings", "production_settings");
+      setDoc(docRef, { id: "production_settings", updatedAt: Date.now(), ...settings }).catch(() => {});
+    }
+    return settings;
+  }
+
+  return null;
 }
 
 export async function saveGlobalSettings(settings) {
@@ -440,7 +459,7 @@ export async function ensureFirestoreSettingsSeeded(defaultSettings) {
   try {
     const docRef = doc(db, "settings", "production_settings");
     const snap = await getDoc(docRef);
-    if (!snap.exists()) {
+    if (!snap.exists() || !Array.isArray(snap.data()?.channels) || snap.data()?.channels.length === 0) {
       await setDoc(docRef, {
         id: "production_settings",
         updatedAt: Date.now(),
