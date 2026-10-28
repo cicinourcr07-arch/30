@@ -1,5 +1,8 @@
+import { db } from "./firebase.js";
+import { doc, setDoc, getDoc, getDocs, collection, deleteDoc } from "firebase/firestore";
+
 // Client-side project storage (IndexedDB). Everything lives in the user's browser
-// — nothing is uploaded. Three object stores:
+// — three object stores:
 //   - "projects": one record per project (name, timestamps, thumbnail, workflow stage,
 //     status, narrative pipeline data, and the serialisable edit state; NO media bytes).
 //   - "media":    the actual image/audio/video Blobs, keyed "<projectId>/<mediaId>".
@@ -95,13 +98,49 @@ export function newId() {
   return "p_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
 
-// Metadata for the projects grid — pulls from online Cloud SQL with IndexedDB cache fallback.
+// Metadata for the projects grid — pulls from Firebase Firestore / Cloud SQL with IndexedDB cache fallback.
 export async function listProjects() {
-  // 1. Try fetching from online Cloud SQL database
+  // 1. Try fetching from online Firebase Firestore database
+  if (db) {
+    try {
+      const snap = await getDocs(collection(db, "projects"));
+      if (!snap.empty) {
+        const remote = snap.docs.map((d) => d.data());
+        tx(STORE_PROJECTS, "readwrite", (s) => {
+          for (const p of remote) {
+            s.put(p);
+          }
+        }).catch(() => {});
+
+        return remote
+          .map((p) => {
+            const np = p.data && p.data.narrative;
+            return {
+              id: p.id,
+              name: p.name,
+              createdAt: p.createdAt,
+              updatedAt: p.updatedAt,
+              thumb: p.thumb || (np && np.reference && np.reference.thumbnailUrl) || null,
+              durationSec: p.durationSec || (np && np.actualDurationSec) || (np && np.config && np.config.targetDurationMinutes ? np.config.targetDurationMinutes * 60 : 0),
+              clipCount: p.clipCount || (np && np.scenes ? np.scenes.length : 0),
+              niche: p.niche || (np && np.selectedConcept && np.selectedConcept.niche) || (np && np.analysis && np.analysis.niche) || "Documentary",
+              currentStage: p.currentStage || (np && np.currentStage) || 1,
+              progressPct: p.progressPct != null ? p.progressPct : (np && np.progressPct != null ? np.progressPct : 0),
+              status: p.status || (np && np.status) || "Draft",
+              archived: !!p.archived,
+            };
+          })
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      }
+    } catch (err) {
+      console.warn("[Firebase Firestore] Error listing projects:", err?.message || err);
+    }
+  }
+
+  // 2. Try fetching from online Cloud SQL database
   try {
     const remote = await fetchApi("/api/db/projects");
-    if (Array.isArray(remote)) {
-      // Background update to local IndexedDB cache
+    if (Array.isArray(remote) && remote.length > 0) {
       tx(STORE_PROJECTS, "readwrite", (s) => {
         for (const p of remote) {
           s.put(p);
@@ -130,7 +169,7 @@ export async function listProjects() {
     }
   } catch (_) {}
 
-  // 2. Offline / local fallback
+  // 3. Offline / local fallback
   const all = await tx(STORE_PROJECTS, "readonly", (s) => reqP(s.getAll()));
   return (all || [])
     .map((p) => {
@@ -154,7 +193,25 @@ export async function listProjects() {
 }
 
 export async function getProject(id) {
-  // 1. Try fetching full project data from Cloud SQL
+  // 1. Try fetching from Firebase Firestore
+  if (db) {
+    try {
+      const cleanId = String(id || "").replace(/[^a-zA-Z0-9_\-]/g, "_");
+      if (cleanId) {
+        const docRef = doc(db, "projects", cleanId);
+        const snap = await getDoc(docRef);
+        if (snap.exists()) {
+          const remote = snap.data();
+          tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(remote))).catch(() => {});
+          return remote;
+        }
+      }
+    } catch (err) {
+      console.warn("[Firebase Firestore] Error fetching project:", err?.message || err);
+    }
+  }
+
+  // 2. Try fetching full project data from Cloud SQL
   try {
     const remote = await fetchApi(`/api/db/projects/${id}`);
     if (remote && remote.id) {
@@ -163,7 +220,7 @@ export async function getProject(id) {
     }
   } catch (_) {}
 
-  // 2. Fallback to local IndexedDB
+  // 3. Fallback to local IndexedDB
   return tx(STORE_PROJECTS, "readonly", (s) => reqP(s.get(id)));
 }
 
@@ -180,6 +237,34 @@ export async function saveProject(record) {
     console.warn("[Cloud SQL Sync] Could not save project online:", err);
   });
 
+  // Sync directly to Firebase Firestore online database
+  if (db) {
+    try {
+      const rawId = String(rec.id || "p_default");
+      const cleanId = rawId.replace(/[^a-zA-Z0-9_\-]/g, "_");
+      const docRef = doc(db, "projects", cleanId);
+      const np = rec.data && rec.data.narrative;
+      await setDoc(docRef, {
+        id: cleanId,
+        name: String(rec.name || "Untitled Project"),
+        createdAt: Number(rec.createdAt || Date.now()),
+        updatedAt: Number(rec.updatedAt || Date.now()),
+        thumb: rec.thumb || (np && np.reference && np.reference.thumbnailUrl) || null,
+        durationSec: Number(rec.durationSec || (np && np.actualDurationSec) || 0),
+        clipCount: Number(rec.clipCount || (np && np.scenes ? np.scenes.length : 0)),
+        niche: String(rec.niche || (np && np.selectedConcept && np.selectedConcept.niche) || "Documentary"),
+        currentStage: Number(rec.currentStage || (np && np.currentStage) || 1),
+        progressPct: Number(rec.progressPct != null ? rec.progressPct : (np && np.progressPct != null ? np.progressPct : 0)),
+        status: String(rec.status || (np && np.status) || "Draft"),
+        archived: Boolean(rec.archived),
+        data: rec.data || {},
+      });
+      console.log(`[Firebase Firestore] Synced project '${cleanId}' online to database.`);
+    } catch (err) {
+      console.warn("[Firebase Firestore] Error saving project:", err?.message || err);
+    }
+  }
+
   return rec;
 }
 
@@ -188,13 +273,7 @@ export async function renameProject(id, name) {
   if (!rec) return null;
   rec.name = name;
   rec.updatedAt = Date.now();
-  await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(rec)));
-
-  fetchApi(`/api/db/projects/${id}/rename`, {
-    method: "PATCH",
-    body: JSON.stringify({ name }),
-  }).catch(() => {});
-
+  await saveProject(rec);
   return rec;
 }
 
@@ -203,13 +282,7 @@ export async function archiveProject(id, archived = true) {
   if (!rec) return null;
   rec.archived = !!archived;
   rec.updatedAt = Date.now();
-  await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(rec)));
-
-  fetchApi(`/api/db/projects/${id}/archive`, {
-    method: "PATCH",
-    body: JSON.stringify({ archived }),
-  }).catch(() => {});
-
+  await saveProject(rec);
   return rec;
 }
 
@@ -223,12 +296,7 @@ export async function duplicateProject(id) {
   cloned.name = `${rec.name || "Untitled"} (Copy)`;
   cloned.createdAt = now;
   cloned.updatedAt = now;
-  await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(cloned)));
-
-  // Duplicate in Cloud SQL online database
-  fetchApi(`/api/db/projects/${id}/duplicate`, {
-    method: "POST",
-  }).catch(() => {});
+  await saveProject(cloned);
 
   // Copy all media blobs from original project to duplicate
   try {
@@ -249,6 +317,15 @@ export async function deleteProject(id) {
   fetchApi(`/api/db/projects/${id}`, {
     method: "DELETE",
   }).catch(() => {});
+
+  if (db) {
+    try {
+      const cleanId = String(id || "").replace(/[^a-zA-Z0-9_\-]/g, "_");
+      if (cleanId) {
+        await deleteDoc(doc(db, "projects", cleanId));
+      }
+    } catch (_) {}
+  }
 }
 
 // ---- media -----------------------------------------------------------------
@@ -297,7 +374,22 @@ export async function syncMedia(projectId, wanted) {
 // ---- global production settings --------------------------------------------
 
 export async function getGlobalSettings() {
-  // 1. Try remote Cloud SQL
+  // 1. Try remote Firebase Firestore database
+  if (db) {
+    try {
+      const docRef = doc(db, "settings", "production_settings");
+      const snap = await getDoc(docRef);
+      if (snap.exists()) {
+        const data = snap.data();
+        tx(STORE_SETTINGS, "readwrite", (s) => reqP(s.put(data, "production_settings"))).catch(() => {});
+        return data;
+      }
+    } catch (err) {
+      console.warn("[Firebase Firestore] Error reading settings:", err?.message || err);
+    }
+  }
+
+  // 2. Try remote Cloud SQL
   try {
     const remote = await fetchApi("/api/db/settings");
     if (remote && typeof remote === "object" && Object.keys(remote).length > 0) {
@@ -306,7 +398,7 @@ export async function getGlobalSettings() {
     }
   } catch (_) {}
 
-  // 2. Local fallback
+  // 3. Local fallback
   try {
     return await tx(STORE_SETTINGS, "readonly", (s) => reqP(s.get("production_settings")));
   } catch (_) {
@@ -319,10 +411,44 @@ export async function saveGlobalSettings(settings) {
     await tx(STORE_SETTINGS, "readwrite", (s) => reqP(s.put(settings, "production_settings")));
   } catch (_) {}
 
+  // 1. Sync to Cloud SQL online database
   fetchApi("/api/db/settings", {
     method: "POST",
     body: JSON.stringify(settings),
   }).catch(() => {});
 
+  // 2. Sync to Firebase Firestore online database
+  if (db) {
+    try {
+      const docRef = doc(db, "settings", "production_settings");
+      await setDoc(docRef, {
+        id: "production_settings",
+        updatedAt: Date.now(),
+        ...settings,
+      });
+      console.log("[Firebase Firestore] Synced global settings & channels online to database.");
+    } catch (err) {
+      console.warn("[Firebase Firestore] Error saving settings:", err?.message || err);
+    }
+  }
+
   return settings;
+}
+
+export async function ensureFirestoreSettingsSeeded(defaultSettings) {
+  if (!db || !defaultSettings) return;
+  try {
+    const docRef = doc(db, "settings", "production_settings");
+    const snap = await getDoc(docRef);
+    if (!snap.exists()) {
+      await setDoc(docRef, {
+        id: "production_settings",
+        updatedAt: Date.now(),
+        ...defaultSettings,
+      });
+      console.log("[Firebase Firestore] Initialized and seeded 'production_settings' collection in Firestore.");
+    }
+  } catch (err) {
+    console.warn("[Firebase Firestore] Seed notice:", err?.message || err);
+  }
 }

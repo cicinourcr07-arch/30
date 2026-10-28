@@ -33,6 +33,7 @@ import {
   newId,
   getGlobalSettings,
   saveGlobalSettings,
+  ensureFirestoreSettingsSeeded,
 } from "./lib/projectStore";
 import {
   createDefaultGlobalSettings,
@@ -808,7 +809,12 @@ export default function Home() {
       try {
         await requestPersist();
         const savedSettings = await getGlobalSettings();
-        if (savedSettings) setGlobalSettings(savedSettings);
+        if (savedSettings) {
+          setGlobalSettings(savedSettings);
+          ensureFirestoreSettingsSeeded(savedSettings);
+        } else {
+          ensureFirestoreSettingsSeeded(globalSettings);
+        }
         setProjects(await listProjects());
         setStorage(await storageEstimate());
       } catch (_) {}
