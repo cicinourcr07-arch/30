@@ -39,6 +39,7 @@ import {
   createDefaultNarrativeData,
   computeProjectStatus,
   formatFilenameTimestamp,
+  recalculateSceneTimings,
 } from "./lib/narrativeModel";
 
 function loadImageEl(file) {
@@ -274,6 +275,8 @@ export default function Home() {
       captionLineHeight: null,
       captionFontScale: null,
       captionsOn: false,
+      captionEffects: [],
+      captionEffectsOn: true,
     });
   const {
     slots = [],
@@ -289,6 +292,8 @@ export default function Home() {
     captionLineHeight = null,
     captionFontScale = null,
     captionsOn = false,
+    captionEffects = [],
+    captionEffectsOn = true,
   } = doc;
 
   const setEffectId = useCallback((id) => {
@@ -324,6 +329,18 @@ export default function Home() {
   const setCaptionsOn = useCallback((val) => {
     commitDoc((d) => ({ ...d, captionsOn: typeof val === "function" ? val(d.captionsOn) : val }));
   }, [commitDoc]);
+  const setCaptionEffects = useCallback((val) => {
+    commitDoc((d) => ({
+      ...d,
+      captionEffects: typeof val === "function" ? val(d.captionEffects || []) : val,
+    }));
+  }, [commitDoc]);
+  const setCaptionEffectsOn = useCallback((val) => {
+    commitDoc((d) => ({
+      ...d,
+      captionEffectsOn: typeof val === "function" ? val(d.captionEffectsOn !== false) : val,
+    }));
+  }, [commitDoc]);
 
   const onAudio = useCallback(async (files) => {
     const file = files[0];
@@ -335,10 +352,30 @@ export default function Home() {
       setAudioUrl(URL.createObjectURL(file));
       setAudioDuration(d);
       getWaveformPeaks(file).then(setPeaks);
-      setNarrative((prev) => ({
-        ...prev,
-        actualDurationSec: Math.round(d),
-      }));
+      const fmtClock = (sec) => {
+        const total = Math.round(sec);
+        const m = Math.floor(total / 60);
+        const s = total % 60;
+        return `${m}:${String(s).padStart(2, "0")}`;
+      };
+      const roundedSec = Math.round(d * 10) / 10;
+      setNarrative((prev) => {
+        const nextScenes = (prev.scenes && prev.scenes.length > 0)
+          ? recalculateSceneTimings(prev.scenes, roundedSec)
+          : (prev.scenes || []);
+        return {
+          ...prev,
+          actualDurationSec: roundedSec,
+          manualDurationInput: fmtClock(d),
+          scenes: nextScenes,
+          outdated: {
+            ...prev.outdated,
+            audio: false,
+            scenes: true,
+            imagePrompts: true,
+          },
+        };
+      });
     } catch (e) { setError(e.message); }
   }, []);
 
@@ -810,6 +847,8 @@ export default function Home() {
       captionLineHeight: null,
       captionFontScale: null,
       captionsOn: false,
+      captionEffects: [],
+      captionEffectsOn: true,
     });
     setNarrative(createDefaultNarrativeData(globalSettings));
     setBuilt(false);
@@ -842,7 +881,11 @@ export default function Home() {
       narrative: { ...narrative, progressPct, status },
       settings: { aspect, fps, renderQuality, transitionDuration, fadeIn, fadeOut, motionAmount, trimEnd, effectId, effectIntensity },
       maps: { motionByName, trimByName, volumeByName, fitByName, effectByName },
-      captions: { captionRaw, captionName, captionsOn, captionStyle, captionColor, captionAnimation, captionSize, captionLineHeight, captionFontScale, captionFont, captionPosition },
+      captions: {
+        captionRaw, captionName, captionsOn, captionStyle, captionColor, captionAnimation,
+        captionSize, captionLineHeight, captionFontScale, captionFont, captionPosition,
+        captionEffects, captionEffectsOn,
+      },
       sfx: serializeSfx(sfx),
       sfxUploads: sfxUploads.map((u) => ({ mediaId: u.mediaId, label: u.label })),
       transitionsByName,
@@ -956,6 +999,8 @@ export default function Home() {
         captionLineHeight: cp.captionLineHeight ?? null,
         captionFontScale: cp.captionFontScale ?? null,
         captionsOn: !!cp.captionsOn,
+        captionEffects: Array.isArray(cp.captionEffects) ? cp.captionEffects : [],
+        captionEffectsOn: cp.captionEffectsOn !== false,
       });
       if (d.narrative) {
         setNarrative({
@@ -1160,6 +1205,8 @@ export default function Home() {
           videosByName, trims, speeds, volumes,
           cues: captionsOn && captionCues.length ? captionCues : null,
           captionStyle, captionColor, captionAnimation, captionSize, captionLineHeight, captionFontScale, captionFont, captionPosition,
+          captionEffects: captionEffectsOn ? captionEffects : [],
+          captionEffectsOn,
           effectId, effectIntensity, effectByName,
           sfx: sfxResolved,
         },
@@ -1463,6 +1510,8 @@ export default function Home() {
               captionFontScale={captionFontScale} setCaptionFontScale={setCaptionFontScale}
               captionFont={captionFont} setCaptionFont={setCaptionFont}
               captionPosition={captionPosition} setCaptionPosition={setCaptionPosition}
+              captionEffects={captionEffects} setCaptionEffects={setCaptionEffects}
+              captionEffectsOn={captionEffectsOn} setCaptionEffectsOn={setCaptionEffectsOn}
               captionName={captionName} captionError={captionError} onCaptionFile={onCaptionFile}
               activeTab={editorTab} onTabChange={setEditorTab}
             />

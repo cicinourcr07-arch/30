@@ -49,8 +49,29 @@ export default function TransitionTile({ tr, t, on, active, onClick, onPick }) {
       onClick={handleClick}
       onPointerEnter={start}
       onPointerLeave={stop}
-      title={item.label}
+      title={`${item.label}${item.labelAr ? " / " + item.labelAr : ""}`}
+      style={{ position: "relative" }}
     >
+      {item.badge && (
+        <span
+          style={{
+            position: "absolute",
+            top: 4,
+            right: 4,
+            fontSize: "9px",
+            fontWeight: "800",
+            padding: "2px 5px",
+            borderRadius: "4px",
+            background: item.badge.includes("TREND") ? "#ef4444" : "rgba(30, 41, 59, 0.85)",
+            color: "#ffffff",
+            letterSpacing: "0.5px",
+            zIndex: 2,
+            boxShadow: "0 2px 4px rgba(0,0,0,0.4)",
+          }}
+        >
+          {item.badge}
+        </span>
+      )}
       <canvas ref={ref} width={140} height={140} className="trtile__cv" />
       <span className="trtile__label">{item.label}</span>
     </button>

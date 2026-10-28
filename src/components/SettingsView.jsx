@@ -1165,10 +1165,10 @@ export default function SettingsView({
                   WebkitTextSecurity: showApiKeys ? "none" : "disc",
                 }}
               />
-              <span className="text-[11px] text-[var(--muted)] mt-1 block">
+              <span className="text-[11px] text-[var(--muted)] mt-1 block leading-relaxed">
                 {isAr
-                  ? "ترتيب العمل التلقائي: يبدأ النظام بالمفتاح الأول، وعندما ينفد رصيده أو يتأخر ينتقل تلقائياً وفوراً للمفتاح الثاني ثم الثالث... كما يتم توزيع توليد البرومبتات والمشاهد بالتوازي على جميع المفاتيح لتسريع التوليد لأقصى درجة."
-                  : "Automatic Failover & Speed: If Key #1 hits rate limits or fails, requests switch immediately to Key #2, Key #3, etc., and batch requests run in parallel across your key pool."}
+                  ? "⚡ نظام التدوير التلقائي الذاتي: يقوم النظام بالتدوير التلقائي المتوازن بين جميع المفاتيح المضافة هنا على كل طلب بدون أي تدخل منك نهائياً. وإذا وصل أي مفتاح لحد الحصة (Quota 429) أو واجه أي عائق، يتم التحويل فوراً وسراً للمفتاح التالي في الحوض لضمان عدم توقف العمل."
+                  : "⚡ Autonomous Round-Robin Rotation: The system automatically and continuously rotates between all added keys on every request with zero manual intervention required, instantly falling over to the next key if any key hits quota limits."}
               </span>
             </div>
           </div>
@@ -1227,7 +1227,15 @@ export default function SettingsView({
                           </span>
                         )}
 
-                        {inCooldown ? (
+                        {poolKey?.isDeniedOrInvalid || st?.isDenied ? (
+                          <span
+                            className="text-[11px] font-semibold text-rose-400 shrink-0 flex items-center gap-1"
+                            title={st?.error || (isAr ? "تم حظر هذا المشروع / المفتاح من Google" : "Project access denied by Google")}
+                          >
+                            <span>🚫</span>
+                            <span>{isAr ? "مرفوض (403 Denied)" : "Denied (403)"}</span>
+                          </span>
+                        ) : inCooldown ? (
                           <span className="text-[11px] font-semibold text-amber-400 shrink-0 flex items-center gap-1">
                             <span>⏳</span>
                             <span>
@@ -1241,6 +1249,7 @@ export default function SettingsView({
                             className={`text-[11px] font-semibold shrink-0 ${
                               st.ok ? "text-emerald-400" : "text-red-400"
                             }`}
+                            title={st.error || ""}
                           >
                             {st.ok ? (isAr ? "يعمل ✓" : "Active ✓") : isAr ? "خطأ/حصة ✗" : "Quota/Err ✗"}
                           </span>

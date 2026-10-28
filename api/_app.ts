@@ -2,6 +2,18 @@ import dns from "node:dns";
 import express from "express";
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import dotenv from "dotenv";
+import {
+  listProjectsSql,
+  getProjectSql,
+  saveProjectSql,
+  renameProjectSql,
+  archiveProjectSql,
+  duplicateProjectSql,
+  deleteProjectSql,
+  getGlobalSettingsSql,
+  saveGlobalSettingsSql,
+} from "../src/db/projects.ts";
+import { generateHeuristicOverlays } from "../src/lib/captions.js";
 
 dns.setDefaultResultOrder("ipv4first");
 dotenv.config();
@@ -23,6 +35,23 @@ let runtimeGeminiConfig = {
 let geminiKeyCursor = 0;
 const failedKeyCooldownUntil = new Map<string, number>();
 const activeRequestsPerKey = new Map<string, number>();
+const permanentlyDeniedKeys = new Set<string>();
+
+// Load persisted settings (including Gemini API keys) from Cloud SQL on startup
+(async function initFromPersistedSettings() {
+  try {
+    const persisted = await getGlobalSettingsSql();
+    if (persisted?.aiSettings?.geminiApiKeys && Array.isArray(persisted.aiSettings.geminiApiKeys)) {
+      const dbKeys = parseKeysString(persisted.aiSettings.geminiApiKeys);
+      if (dbKeys.length > 0) {
+        runtimeGeminiConfig.apiKeys = Array.from(new Set([...runtimeGeminiConfig.apiKeys, ...dbKeys]));
+        console.log(`[Auto-Key Rotation] Loaded ${dbKeys.length} Gemini API keys from Cloud SQL database for automatic rotation.`);
+      }
+    }
+  } catch (err) {
+    // Cloud SQL will be read upon next request
+  }
+})();
 
 function parseKeysString(val: unknown): string[] {
   if (!val) return [];
@@ -89,18 +118,27 @@ export function resolveGeminiApiKeys(reqBody?: any): string[] {
     }
   };
 
-  // 1. PRIMARY PRIORITY: Active Google account / platform-injected credentials
-  // This ensures changing Google accounts in AI Studio immediately takes effect.
-  addAll(parseKeysString(process.env.GEMINI_API_KEY));
-  addAll(parseKeysString(process.env.GOOGLE_API_KEY));
-  addAll(parseKeysString(process.env.GOOGLE_GENAI_API_KEY));
-  addAll(parseKeysString(process.env.GEMINI_API_KEYS));
-  addAll(parseKeysString(process.env.GOOGLE_API_KEYS));
+  // If request contains keys, sync to runtimeGeminiConfig immediately so all endpoints benefit
+  if (reqBody) {
+    const incoming = [
+      ...parseKeysString(reqBody.geminiApiKeys),
+      ...parseKeysString(reqBody.geminiKeys),
+      ...parseKeysString(reqBody?.geminiConfig?.apiKeys),
+      ...parseKeysString(reqBody?.geminiConfig?.apiKey),
+    ];
+    if (incoming.length > 0) {
+      for (const ik of incoming) {
+        if (!runtimeGeminiConfig.apiKeys.includes(ik)) {
+          runtimeGeminiConfig.apiKeys.push(ik);
+        }
+      }
+    }
+  }
 
-  // 2. Server runtime-configured Gemini keys
+  // 1. PRIMARY PRIORITY: Keys placed by user in settings / database (autonomous round-robin rotation)
   addAll(runtimeGeminiConfig.apiKeys);
 
-  // 3. User request-supplied keys (secondary fallback workers)
+  // 2. User request-supplied keys (from localStorage / active session)
   if (reqBody && !reqBody.useActiveAccountOnly) {
     addAll(parseKeysString(reqBody.geminiApiKeys));
     addAll(parseKeysString(reqBody.geminiKeys));
@@ -109,6 +147,13 @@ export function resolveGeminiApiKeys(reqBody?: any): string[] {
     addAll(parseKeysString(reqBody?.codecraftConfig?.apiKeys));
     addAll(parseKeysString(reqBody?.codecraftConfig?.apiKey));
   }
+
+  // 3. Platform & environment keys
+  addAll(parseKeysString(process.env.GEMINI_API_KEY));
+  addAll(parseKeysString(process.env.GOOGLE_API_KEY));
+  addAll(parseKeysString(process.env.GOOGLE_GENAI_API_KEY));
+  addAll(parseKeysString(process.env.GEMINI_API_KEYS));
+  addAll(parseKeysString(process.env.GOOGLE_API_KEYS));
 
   // 4. Numbered env vars: GEMINI_API_KEY_1..50, GOOGLE_API_KEY_1..50, GEMINI_KEY_1..50
   for (let i = 1; i <= 50; i++) {
@@ -176,12 +221,15 @@ export function getModelFallbackChain(initialModel: string, customChain?: string
 
   const clean = String(initialModel || "").replace(/^models\//, "").trim() || "gemini-3.8-flash";
 
-  // Full compatible text and reasoning fallback cascade using strictly valid active free-tier models
+  // Full compatible text and reasoning fallback cascade ordered from newest 3.8 down to older models
   const standardTextCascade = [
     "gemini-3.8-flash",
-    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
     "gemini-flash-latest",
-    "gemini-3.1-pro-preview",
   ];
 
   const chain = [clean, ...standardTextCascade.filter((m) => m !== clean)];
@@ -220,8 +268,11 @@ function extractErrorDetails(err: any): {
       );
 
     const isKeyAuthError =
-      status === 400 &&
-      /API_KEY_INVALID|API\s*key\s*not\s*valid|invalid\s*api\s*key|permission_denied/i.test(
+      status === 401 ||
+      status === 403 ||
+      (status === 400 &&
+        /API_KEY_INVALID|API\s*key\s*not\s*valid|invalid\s*api\s*key/i.test(fullStr)) ||
+      /permission_denied|denied\s*access|access\s*denied|blocked|forbidden|unauthorized|project\s*has\s*been\s*denied/i.test(
         fullStr
       );
 
@@ -247,7 +298,8 @@ export function getGeminiKeysPoolStatus(reqBody?: any) {
   const now = Date.now();
   const keys = allKeys.map((k, idx) => {
     const cooldownUntil = failedKeyCooldownUntil.get(k) || 0;
-    const inCooldown = cooldownUntil > now;
+    const isDeniedOrInvalid = permanentlyDeniedKeys.has(k) || (cooldownUntil - now > 300_000);
+    const inCooldown = isDeniedOrInvalid || cooldownUntil > now;
     const remainingCooldownSec = inCooldown ? Math.ceil((cooldownUntil - now) / 1000) : 0;
     const masked = k.length > 10 ? `${k.slice(0, 6)}...${k.slice(-4)}` : "••••••••";
     const activeReqs = activeRequestsPerKey.get(k) || 0;
@@ -255,6 +307,7 @@ export function getGeminiKeysPoolStatus(reqBody?: any) {
       index: idx + 1,
       masked,
       inCooldown,
+      isDeniedOrInvalid,
       remainingCooldownSec,
       activeRequests: activeReqs,
     };
@@ -307,29 +360,37 @@ async function executeGeminiWithFailover<T>(
     const modelToTry = modelsToAttempt[mIdx];
     const isFallbackModel = modelToTry !== requestedModel;
 
-    // Pick keys that are currently not in cooldown, or all keys if all are cooling down
-    const healthyKeys = allKeys.filter((k) => (failedKeyCooldownUntil.get(k) || 0) <= Date.now());
-    const candidatePool = healthyKeys.length > 0 ? healthyKeys : allKeys;
+    // 1. Filter out permanently denied keys (403, invalid, or quarantined)
+    const nonDeniedKeys = allKeys.filter((k) => !permanentlyDeniedKeys.has(k));
+    const poolWithoutDenied = nonDeniedKeys.length > 0 ? nonDeniedKeys : allKeys;
 
-    let preferredKey: string;
+    // 2. Order candidate pool: healthy keys first, followed by cooldown keys as secondary backup
+    const healthyKeys = poolWithoutDenied.filter(
+      (k) => (failedKeyCooldownUntil.get(k) || 0) <= Date.now()
+    );
+    const cooldownKeys = poolWithoutDenied.filter(
+      (k) => (failedKeyCooldownUntil.get(k) || 0) > Date.now()
+    );
+    const candidatePool = healthyKeys.length > 0 ? [...healthyKeys, ...cooldownKeys] : poolWithoutDenied;
+
+    let orderedKeys: string[];
     if (typeof parallelWorkerIdx === "number") {
-      preferredKey = candidatePool[Math.abs(parallelWorkerIdx) % candidatePool.length];
+      const pick = candidatePool[Math.abs(parallelWorkerIdx) % candidatePool.length];
+      orderedKeys = [pick, ...candidatePool.filter((k) => k !== pick)];
     } else {
       const keysWithLoad = candidatePool.map((k) => ({
         key: k,
         active: activeRequestsPerKey.get(k) || 0,
+        inCooldown: (failedKeyCooldownUntil.get(k) || 0) > Date.now(),
       }));
-      const minActive = Math.min(...keysWithLoad.map((k) => k.active));
-      const leastBusyKeys = keysWithLoad.filter((k) => k.active === minActive).map((k) => k.key);
+      const readyKeys = keysWithLoad.filter((k) => !k.inCooldown);
+      const targetPool = readyKeys.length > 0 ? readyKeys : keysWithLoad;
+      const minActive = Math.min(...targetPool.map((k) => k.active));
+      const leastBusyKeys = targetPool.filter((k) => k.active === minActive).map((k) => k.key);
       const pickIdx = Math.abs(geminiKeyCursor++) % leastBusyKeys.length;
-      preferredKey = leastBusyKeys[pickIdx];
+      const preferredKey = leastBusyKeys[pickIdx];
+      orderedKeys = [preferredKey, ...candidatePool.filter((k) => k !== preferredKey)];
     }
-
-    const orderedKeys = [
-      preferredKey,
-      ...candidatePool.filter((k) => k !== preferredKey),
-      ...allKeys.filter((k) => !candidatePool.includes(k)),
-    ];
 
     let modelExhaustedOrSpike = false;
 
@@ -371,7 +432,7 @@ async function executeGeminiWithFailover<T>(
         return result;
       } catch (err: any) {
         lastError = err;
-        const { isQuotaExhausted, isDemandSpike, isKeyAuthError, msg } = extractErrorDetails(err);
+        const { isQuotaExhausted, isDemandSpike, isKeyAuthError } = extractErrorDetails(err);
 
         // 1. Quota Exhaustion (429, limit exceeded) on THIS specific key
         if (isQuotaExhausted) {
@@ -406,22 +467,26 @@ async function executeGeminiWithFailover<T>(
           break; // Model level issue, advance model!
         }
 
-        // 3. Invalid API key error (400 / PERMISSION_DENIED)
+        // 3. Invalid API key error or Project Access Denied (400 / 401 / 403 / PERMISSION_DENIED / DENIED_ACCESS)
         if (isKeyAuthError) {
-          console.warn(
-            `[Gemini Key Auth Warning] Key #${originalKeyNumber}/${allKeys.length} (${maskedKey}) invalid or unauthorized. Putting in 5min cooldown and failing over...`
+          permanentlyDeniedKeys.add(key);
+          failedKeyCooldownUntil.set(key, Date.now() + 86_400_000); // 24 hours quarantine
+          console.info(
+            `[Gemini Rotation] Key #${originalKeyNumber}/${allKeys.length} (${maskedKey}) denied access by Google (HTTP 403). Quarantined permanently. Continuing immediately with next healthy key.`
           );
-          failedKeyCooldownUntil.set(key, Date.now() + 300_000);
           if (attempt < orderedKeys.length - 1) {
             keySwitched = true;
             continue;
+          } else {
+            modelExhaustedOrSpike = true;
+            break;
           }
         } else {
           failedKeyCooldownUntil.set(key, Date.now() + 30_000);
           if (attempt < orderedKeys.length - 1) {
             keySwitched = true;
-            console.warn(
-              `[Gemini Failover] Key #${originalKeyNumber}/${allKeys.length} transient error (${msg.slice(0, 90)}). Trying next key...`
+            console.info(
+              `[Gemini Failover] Key #${originalKeyNumber}/${allKeys.length} (${maskedKey}) transient delay. Trying next key in pool...`
             );
             continue;
           }
@@ -435,6 +500,13 @@ async function executeGeminiWithFailover<T>(
     if (modelExhaustedOrSpike && mIdx < modelsToAttempt.length - 1) {
       continue;
     }
+  }
+
+  const allDenied = allKeys.length > 0 && allKeys.every((k) => permanentlyDeniedKeys.has(k));
+  if (allDenied) {
+    throw new Error(
+      "جميع مفاتيح Google Gemini تم حظرها أو رفض الوصول لها (403 Project Access Denied). يرجى فتح الإعدادات وإدخال مفتاح API صالح من Google AI Studio."
+    );
   }
 
   throw lastError || new Error("Gemini AI operation failed across all keys and fallback models.");
@@ -706,6 +778,7 @@ app.post("/api/account/sync", (_req, res) => {
   } catch {}
   modelQuotaExhaustedUntil.clear();
   failedKeyCooldownUntil.clear();
+  permanentlyDeniedKeys.clear();
   const geminiKeys = resolveGeminiApiKeys();
   const accountInfo = getActiveGoogleAccountInfo();
   const keyPool = getGeminiKeysPoolStatus();
@@ -783,6 +856,7 @@ const handleUpdateGeminiConfig = async (req: express.Request, res: express.Respo
     if (parsedIncoming.length > 0 || Array.isArray(apiKeys) || typeof apiKey === "string") {
       runtimeGeminiConfig.apiKeys = Array.from(new Set(parsedIncoming));
       failedKeyCooldownUntil.clear();
+      permanentlyDeniedKeys.clear();
     }
     if (textModel) runtimeGeminiConfig.textModel = String(textModel).trim();
     if (imageModel) runtimeGeminiConfig.imageModel = String(imageModel).trim();
@@ -841,11 +915,23 @@ const handleUpdateGeminiConfig = async (req: express.Request, res: express.Respo
             failedKeyCooldownUntil.delete(k);
             return { index: idx + 1, masked, ok: true };
           } catch (err: any) {
+            const errStr = String(err?.message || err || "Failed");
+            const isDenied =
+              err?.status === 403 ||
+              err?.status === 401 ||
+              /denied\s*access|permission_denied|API_KEY_INVALID/i.test(errStr);
+            if (isDenied) {
+              permanentlyDeniedKeys.add(k);
+              failedKeyCooldownUntil.set(k, Date.now() + 86_400_000);
+            }
             return {
               index: idx + 1,
               masked,
               ok: false,
-              error: String(err?.message || err || "Failed").slice(0, 120),
+              isDenied,
+              error: isDenied
+                ? "تم حظر هذا المشروع / المفتاح (403 Access Denied)"
+                : errStr.slice(0, 120),
             };
           }
         })
@@ -1341,10 +1427,14 @@ export function cleanVoiceoverScriptOnly(text: string): string {
 // 2. Analyze Reference + Thumbnail Vision + Generate 5 Original Concepts + Visual Style Lock
 app.post("/api/ai/analyze-reference", async (req, res) => {
   try {
+    let apiRes: any = null;
     const {
       projectName,
       youtubeUrl,
       referenceTitle,
+      referenceMode,
+      topicName,
+      topicDescription,
       channelName,
       description,
       pastedTranscript,
@@ -1359,6 +1449,9 @@ app.post("/api/ai/analyze-reference", async (req, res) => {
 
     const provider = resolveEffectiveProvider(requestedProvider, req.body);
     const effectiveNiche = String(channelNiche || nichePreference || channelProfile?.niche || "").trim();
+    const effectiveTitle = referenceTitle || topicName || "";
+    const effectiveDescription = description || topicDescription || "";
+    const isTopicMode = referenceMode === "topic" || (!youtubeUrl && Boolean(effectiveTitle));
 
     const nicheDirective = effectiveNiche
       ? `
@@ -1368,32 +1461,40 @@ app.post("/api/ai/analyze-reference", async (req, res) => {
 The user's channel operates EXCLUSIVELY in the following niche: "${effectiveNiche}".
 ALL 5 generated concepts MUST belong 100% to this specific niche ("${effectiveNiche}").
 Under NO circumstance should you generate concepts for other unrelated topics or niches!
-You must borrow the reference video's storytelling pace, tension building, curiosity gap style, and viral mechanics,
+You must borrow the reference's storytelling pace, tension building, curiosity gap style, and viral mechanics,
 BUT transpose everything completely into the user's channel niche ("${effectiveNiche}").
 Every single concept's title, premise, hook, story structure, and payoff MUST be strictly within "${effectiveNiche}".
 ================================================================================`
       : "";
 
-    const promptText = `You are an expert YouTube creative director and visual narrative analyst.
-Analyze the provided YouTube reference information ${thumbnailBase64 ? "and the attached reference thumbnail image " : ""}to produce:
-1. A comprehensive Reference Analysis Report.
-2. A Visual Style Lock extracted from the reference's visual appeal (or tailored to the niche if no thumbnail was provided).
-3. Exactly 5 distinct, original video concepts inspired by the reference's general appeal, curiosity gap, and audience—without copying the reference's title or script.
+    const promptText = `You are an expert YouTube creative director and visual narrative strategist.
+Analyze the provided input information to produce:
+1. A comprehensive Analysis Report (mainTopic, niche, subNiche, targetAudience, curiosityGap, openingHook, storytellingStructure, narrationTone, visualStyle, colorPalette, characterDesign, compositionLighting, engagementFactors, originalOpportunities, transcriptAnalyzed).
+2. A Visual Style Lock tailored to the topic and niche (artStyle, characterRules, facialVisibility, clothingSilhouette, colorPalette, lighting, backgroundTreatment, composition, lineworkShading, aspectRatio).
+3. "userConcept": FULLY PREPARE AND EXPAND THE USER'S ORIGINAL IDEA as a complete production-ready concept:
+   - Stay 100% faithful to the user's submitted idea ("${effectiveTitle}") and description ("${effectiveDescription || ""}"), honoring their exact narrative focus.
+   - Professionally flesh out all required concept fields: title, premise, niche, subNiche, targetAudience, mainHook, storyStructure, narrationStyle, visualDirection, viewerAppeal, differentiation, and payoff.
+   - Set id to "user-original-concept".
+4. "concepts": EXACTLY 5 FRESH, DISTINCT, ORIGINAL ALTERNATIVE CONCEPTS exploring different captivating angles, untold stories, or creative twists on this topic ("${effectiveTitle}").
+
 ${nicheDirective}
 
 Reference Details:
+- Mode: ${isTopicMode ? "Direct Topic" : "YouTube Reference"}
 - Project Name: ${projectName || "Untitled Project"}
 - YouTube URL: ${youtubeUrl || "N/A"}
-- Reference Title: ${referenceTitle || "Not provided"}
+- Topic Name / Subject: "${effectiveTitle}"
+- Description: ${effectiveDescription || "Not provided (use full creative freedom)"}
 - Channel: ${channelName || "Unknown"}
-- Description: ${description || "Not provided"}
 - Channel Niche: ${effectiveNiche || "Infer from reference"}
-- Language Preference: ${languagePreference || "English (US)"}
-- Pasted Transcript / Notes: ${pastedTranscript ? String(pastedTranscript).slice(0, 12000) : "Not provided (analyze based on title, metadata, and thumbnail vision only; note clearly in narrationTone that transcript was not supplied)"}
+- Language Preference: ${languagePreference || "English"}
+- MANDATORY LANGUAGE: You MUST generate ALL content, concepts, reports, and style locks STRICTLY in the following language: "${languagePreference || "English"}". If the input topic or reference is in another language, you must translate your entire output into "${languagePreference || "English"}".
+- Pasted Transcript / Notes: ${pastedTranscript ? String(pastedTranscript).slice(0, 12000) : "Not provided (analyze based on title, metadata, and thumbnail vision only)"}
 
 IMPORTANT RULES:
-${effectiveNiche ? `- ALL 5 concepts MUST strictly belong to the specified channel niche: "${effectiveNiche}".` : "- Never assume the channel is about finance or business unless the reference explicitly is. Adapt naturally to history, science, documentary, mystery, nature, storytelling, education, technology, etc."}
-- Generate 5 genuinely distinct, original concepts with compelling titles, premises, hooks, and payoffs.`;
+${effectiveNiche ? `- ALL concepts MUST strictly belong to the specified channel niche: "${effectiveNiche}".` : "- Adapt naturally to history, science, documentary, mystery, nature, storytelling, education, technology, etc."}
+- CRITICAL: Provide "userConcept" (the user's idea fully prepared) PLUS "concepts" (5 alternative angles).
+- ALL visual directions, scene descriptions, and image prompts MUST be descriptive, atmospheric, and highly detailed.`;
 
     if (provider === "external" || provider === "codecraft") {
       const cc = getCodeCraftCreds(req.body);
@@ -1401,7 +1502,7 @@ ${effectiveNiche ? `- ALL 5 concepts MUST strictly belong to the specified chann
         apiKey: cc.apiKey,
         baseUrl: cc.baseUrl,
         model: cc.textModel,
-        prompt: `${promptText}\n\nReturn strictly valid JSON with keys: "analysis" (mainTopic, niche, subNiche, targetAudience, curiosityGap, openingHook, storytellingStructure, narrationTone, visualStyle, colorPalette, characterDesign, compositionLighting, engagementFactors[], originalOpportunities[], transcriptAnalyzed), "visualStyleLock" (artStyle, characterRules, facialVisibility, clothingSilhouette, colorPalette, lighting, backgroundTreatment, composition, lineworkShading, aspectRatio), and "concepts" (array of 5 objects with id, title, premise, niche, subNiche, targetAudience, mainHook, storyStructure, narrationStyle, visualDirection, viewerAppeal, differentiation, payoff).`,
+        prompt: `${promptText}\n\nReturn strictly valid JSON with keys: "analysis", "visualStyleLock", "userConcept" (object with id="user-original-concept", title, premise, niche, subNiche, targetAudience, mainHook, storyStructure, narrationStyle, visualDirection, viewerAppeal, differentiation, payoff), and "concepts" (array of 5 alternative concept objects with the same fields).`,
         imageBase64: thumbnailBase64,
         imageMime: thumbnailMime,
         jsonMode: true,
@@ -1421,7 +1522,9 @@ ${effectiveNiche ? `- ALL 5 concepts MUST strictly belong to the specified chann
     }
     parts.push({ text: promptText });
 
-    const response = await executeGeminiWithFailover(
+    let responseText = "{}";
+    try {
+      apiRes = await executeGeminiWithFailover(
       (ai, _kIdx, _tot, modelToUse) =>
         ai.models.generateContent({
           model: modelToUse,
@@ -1495,6 +1598,39 @@ ${effectiveNiche ? `- ALL 5 concepts MUST strictly belong to the specified chann
                   "aspectRatio",
                 ],
               },
+              userConcept: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  title: { type: Type.STRING },
+                  premise: { type: Type.STRING },
+                  niche: { type: Type.STRING },
+                  subNiche: { type: Type.STRING },
+                  targetAudience: { type: Type.STRING },
+                  mainHook: { type: Type.STRING },
+                  storyStructure: { type: Type.STRING },
+                  narrationStyle: { type: Type.STRING },
+                  visualDirection: { type: Type.STRING },
+                  viewerAppeal: { type: Type.STRING },
+                  differentiation: { type: Type.STRING },
+                  payoff: { type: Type.STRING },
+                },
+                required: [
+                  "id",
+                  "title",
+                  "premise",
+                  "niche",
+                  "subNiche",
+                  "targetAudience",
+                  "mainHook",
+                  "storyStructure",
+                  "narrationStyle",
+                  "visualDirection",
+                  "viewerAppeal",
+                  "differentiation",
+                  "payoff",
+                ],
+              },
               concepts: {
                 type: Type.ARRAY,
                 items: {
@@ -1532,15 +1668,198 @@ ${effectiveNiche ? `- ALL 5 concepts MUST strictly belong to the specified chann
                 },
               },
             },
-            required: ["analysis", "visualStyleLock", "concepts"],
+            required: ["analysis", "visualStyleLock", "userConcept", "concepts"],
           },
         }),
       }),
       req.body
     );
+      if (apiRes && typeof apiRes.text === "string") {
+        responseText = apiRes.text;
+      }
+    } catch (geminiErr: any) {
+      console.error("Gemini analyze-reference execution error:", geminiErr?.message || geminiErr);
+    }
 
-    const parsed = parseJsonClean(response.text || "{}");
-    attachResponseTelemetry(parsed, response);
+    const parsed = parseJsonClean(responseText);
+
+    // 1. Prepare and ensure the user's original concept is fully formulated
+    let preparedUserConcept: any = parsed?.userConcept || null;
+    const fallbackTopic = effectiveTitle || "فكرتك الأصلية";
+    if (!preparedUserConcept || typeof preparedUserConcept !== "object" || !preparedUserConcept.title) {
+      preparedUserConcept = {
+        id: "user-original-concept",
+        isUserOriginal: true,
+        title: effectiveTitle || "فكرتك الأصلية المعتمدة",
+        premise: effectiveDescription
+          ? `${effectiveDescription}`
+          : `المعالجة السردية الشاملة لفكرة "${fallbackTopic}" وفق رؤيتك المباشرة وتفاصيلها الأساسية.`,
+        niche: effectiveNiche || parsed?.analysis?.niche || "وثائقي وسرد قصصي",
+        subNiche: parsed?.analysis?.subNiche || "سرد استقصائي",
+        targetAudience: parsed?.analysis?.targetAudience || "جمهور الوثائقيات والمحتوى السردي الهادف",
+        mainHook: parsed?.analysis?.openingHook || `الحقيقة الكاملة وراء ${fallbackTopic} كما لم تُروَ من قبل.`,
+        storyStructure: "استهلال مباشر يطرح الفكرة بقوة، استعراض وقائع القصة وتسلسلها، وبناء ذروة سردية متماسكة.",
+        narrationStyle: parsed?.analysis?.narrationTone || "سرد وثائقي رصين ومشوق",
+        visualDirection: parsed?.analysis?.visualStyle || "لقطات سينمائية مع إضاءة درامية وتباين ألوان متقن",
+        viewerAppeal: "تجسيد الفكرة الأصلية بدقة مع إبراز كل جوانبها المهمة للجمهور",
+        differentiation: "الالتزام الدقيق برؤيتك الأصلية دون تغيير زاوية القصة الأساسية",
+        payoff: "إيصال الرسالة الكاملة للقصة بوضوح وعمق يترك أثراً قوياً لدى المشاهد.",
+      };
+    } else {
+      preparedUserConcept = {
+        ...preparedUserConcept,
+        id: "user-original-concept",
+        isUserOriginal: true,
+        title: preparedUserConcept.title || effectiveTitle || "فكرتك الأصلية المعتمدة",
+      };
+    }
+
+    // 2. Extract and sanitize the 5 alternative concepts
+    let rawConcepts: any[] = Array.isArray(parsed?.concepts)
+      ? parsed.concepts
+      : Array.isArray(parsed?.ideas)
+      ? parsed.ideas
+      : Array.isArray(parsed?.suggestions)
+      ? parsed.suggestions
+      : Array.isArray(parsed?.data?.concepts)
+      ? parsed.data.concepts
+      : [];
+
+    // Filter out user-original-concept if present inside rawConcepts
+    rawConcepts = rawConcepts.filter((c) => c && c.id !== "user-original-concept");
+
+    // Guarantee 5 distinct alternative proposals even if model returned empty
+    if (!rawConcepts || rawConcepts.length === 0) {
+      rawConcepts = [
+        {
+          id: "concept-1",
+          isUserOriginal: false,
+          title: `${fallbackTopic}: البدايات الغامضة والسر المفقود`,
+          premise: `استكشاف الجذور التاريخية والألغاز غير المروية حول "${fallbackTopic}" من خلال معالجة استقصائية مشوقة.`,
+          niche: effectiveNiche || "وثائقي وسرد قصصي",
+          subNiche: "ألغاز وأسرار",
+          targetAudience: "عشاق المعرفة والوثائقيات والقصص المشوقة",
+          mainHook: `ما الذي لم يخبرك به أحد عن ${fallbackTopic}؟ حقيقة واحدة غيرت كل شيء.`,
+          storyStructure: "مقدمة مشوقة مع لغز محير، استعراض الأدلة، ونهاية غير متوقعة.",
+          narrationStyle: "سرد تحقيقي هادئ ومكثف الإثارة",
+          visualDirection: "لقطات سينمائية مع إضاءة درامية وتباين ألوان دافئ وعميق",
+          viewerAppeal: "إثارة الفضول الإنساني وكشف أبعاد غير مألوفة",
+          differentiation: "طرح عميق يربط الماضي بالحاضر بزاوية غير مسبوقة",
+          payoff: "إدراك البعد الحقيقي للقصة وتأثيرها الممتد.",
+        },
+        {
+          id: "concept-2",
+          isUserOriginal: false,
+          title: `لحظة التحول: كيف غيّر ${fallbackTopic} مجرى التاريخ؟`,
+          premise: `التركيز على نقطة التحول الحرجة في أحداث "${fallbackTopic}" وكيف صاغت النتائج الكبرى.`,
+          niche: effectiveNiche || "وثائقي وسرد قصصي",
+          subNiche: "نقاط التحول التاريخية",
+          targetAudience: "المهتمون بالقصص الدرامية والتحولات المفصلية",
+          mainHook: `قرار واحد أو صدفة غريبة قلبت موازين كل شيء في ${fallbackTopic}.`,
+          storyStructure: "تسليط الضوء على الأزمة، اللحظة الحاسمة، والتداعيات الدرامية.",
+          narrationStyle: "إيقاع سريع وتصاعدي متوتر",
+          visualDirection: "حركات كاميرا ديناميكية ولقطات مقربة معبرة",
+          viewerAppeal: "حبس الأنفاس حتى آخر ثانية",
+          differentiation: "التركيز على القرارات البشرية المؤثرة",
+          payoff: "استيعاب حجم التأثير المذهل للحظة واحدة في التاريخ.",
+        },
+        {
+          id: "concept-3",
+          isUserOriginal: false,
+          title: `الأسرار المحرمة لـ ${fallbackTopic}: ما وراء السجلات الرسمية`,
+          premise: `الغوص عميقاً في الشهادات المنسية والوثائق غير الشائعة حول "${fallbackTopic}".`,
+          niche: effectiveNiche || "وثائقي وسرد قصصي",
+          subNiche: "كواليس وأسرار",
+          targetAudience: "عشاق البحث والاستكشاف وكسر المألوف",
+          mainHook: `السجلات الرسمية تخفي نصف الحقيقة... فماذا حدث بالفعل؟`,
+          storyStructure: "مقارنة الرواية السائدة بالأدلة الواقعية الجديدة.",
+          narrationStyle: "أسلوب كاشف وتحليلي عميق",
+          visualDirection: "أجواء أرشيفية واقعية مع إضاءة سينمائية جانبية",
+          viewerAppeal: "الشعور باكتشاف سر حصري لأول مرة",
+          differentiation: "الاعتماد على التفاصيل النادرة والزوايا غير المطروقة",
+          payoff: "إعادة بناء الصورة الكاملة بدون رتوش.",
+        },
+        {
+          id: "concept-4",
+          isUserOriginal: false,
+          title: `الإنسان في قلب ${fallbackTopic}: صراع البقاء والمصير`,
+          premise: `رواية درامية إنسانية تركز على الشخصيات والدوافع والمشاعر في قصة "${fallbackTopic}".`,
+          niche: effectiveNiche || "وثائقي وسرد قصصي",
+          subNiche: "دراما إنسانية",
+          targetAudience: "جمهور الروايات العاطفية والملحمية",
+          mainHook: `بين الشجاعة واليأس... قصة أولئك الذين عاشوا التجربة بأنفسهم.`,
+          storyStructure: "تقديم الشخصية المحورية، الصراع الدرامي، واللحظة الحاسمة.",
+          narrationStyle: "نبرة دافئة ذات شحنة عاطفية ملهمة",
+          visualDirection: "بورتريهات بصرية قوية وتكوينات سينمائية دافئة",
+          viewerAppeal: "تفاعل عاطفي مباشر وتأثر بالقصة",
+          differentiation: "أنسنة الموضوع وتحويله إلى ملحمة شخصية",
+          payoff: "عبرة إنسانية خالدة تلامس المشاهد.",
+        },
+        {
+          id: "concept-5",
+          isUserOriginal: false,
+          title: `ما بعد ${fallbackTopic}: الدرس الأخير للمستقبل`,
+          premise: `نظرة مستقبلية واستنتاجية تستخلص الدروس الكبرى من "${fallbackTopic}" وتطبقها على واقعنا المعاصر.`,
+          niche: effectiveNiche || "وثائقي وسرد قصصي",
+          subNiche: "فلسفة ورؤى مستقبلية",
+          targetAudience: "المفكرون ورواد التنمية وعشاق التحليل المستقبلي",
+          mainHook: `هل التاريخ يعيد نفسه حقاً؟ الإجابة تكمن في ما حدث بعد ذلك.`,
+          storyStructure: "عرض النهايات، تحليل التبعات، واستشراف المستقبل.",
+          narrationStyle: "نبرة ملهمة، حكيمة، ومحفزة للتفكير",
+          visualDirection: "أفق بصري واسع، انتقالات سلسة وإضاءة ذهبية ملهمة",
+          viewerAppeal: "خلاصة فكرية قيّمة يخرج بها المشاهد",
+          differentiation: "ربط القصة بالواقع الراهن والتحديات المستقبلية",
+          payoff: "إلهام حقيقي وفهم متجدد للعالم من حولنا.",
+        },
+      ];
+    } else {
+      rawConcepts = rawConcepts.slice(0, 5).map((c, idx) => ({
+        ...c,
+        id: c.id || `concept-${idx + 1}`,
+        isUserOriginal: false,
+      }));
+    }
+
+    // Combine: User's original concept FIRST, followed by 5 alternative creative proposals (Total: 6 options)
+    parsed.userConcept = preparedUserConcept;
+    parsed.concepts = [preparedUserConcept, ...rawConcepts];
+
+    if (!parsed.analysis) {
+      parsed.analysis = {
+        mainTopic: effectiveTitle || "Direct Topic Analysis",
+        niche: effectiveNiche || "Documentary / Narrative",
+        subNiche: "Deep Narrative Strategy",
+        targetAudience: "Global Narrative Video Audience",
+        curiosityGap: `ما الأسرار غير المكتشفة في ${effectiveTitle}؟`,
+        openingHook: `قصة تبدأ من حيث اعتقد الجميع أنها انتهت...`,
+        storytellingStructure: "Three-Act Dramatic Progression with high retention hooks",
+        narrationTone: "Cinematic, engaging, and authoritative",
+        visualStyle: "Atmospheric Cinematic Realism",
+        colorPalette: "Rich contrast with golden and deep tones",
+        characterDesign: "Authentic, expressive, high-detail characters",
+        compositionLighting: "Volumetric cinematic lighting with 35mm framing",
+        engagementFactors: ["Curiosity Gap", "Pacing Dynamics", "Visual Payoff"],
+        originalOpportunities: ["Untold Perspectives", "Modern Relevance", "Emotional Resonance"],
+        transcriptAnalyzed: false,
+      };
+    }
+
+    if (!parsed.visualStyleLock) {
+      parsed.visualStyleLock = {
+        artStyle: "Cinematic Realistic Illustration",
+        characterRules: "Topic-appropriate realistic proportions and expressive faces",
+        facialVisibility: "Clear expressive eyes and cinematic lighting",
+        clothingSilhouette: "Authentic detailed period or modern clothing",
+        colorPalette: "Deep atmospheric palette with warm golden highlights",
+        lighting: "Cinematic golden hour and volumetric rim lighting",
+        backgroundTreatment: "Rich painterly environmental depth with soft blur",
+        composition: "35mm anamorphic widescreen composition",
+        lineworkShading: "Naturalistic soft shading with fine textural realism",
+        aspectRatio: "16:9",
+      };
+    }
+
+    attachResponseTelemetry(parsed, apiRes);
     res.json(parsed);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "AI reference analysis failed." });
@@ -2053,18 +2372,37 @@ app.post("/api/ai/scene-breakdown", async (req, res) => {
       channelProfile,
       provider: requestedProvider,
     } = req.body || {};
-    if (!script || typeof script !== "string") {
-      return res.status(400).json({ error: "Approved script is required for scene breakdown." });
+
+    let effectiveScript = (typeof script === "string" ? script.trim() : "");
+    if (!effectiveScript) {
+      if (concept) {
+        effectiveScript = [
+          concept.mainHook || `في هذه القصة المشوقة حول ${concept.title || "هذا الموضوع"}، نكشف ما وراء الكواليس.`,
+          concept.premise || "",
+          concept.storyStructure || "",
+          concept.differentiation || "",
+          concept.payoff || `هكذا تتضح أبعاد القصة الكاملة وتترك أثراً عميقاً في الذاكرة.`,
+        ].filter(Boolean).join("\n\n");
+      } else if (req.body?.topicName || req.body?.referenceTitle) {
+        const tName = req.body.topicName || req.body.referenceTitle;
+        const tDesc = req.body.topicDescription || req.body.description || "";
+        effectiveScript = `نستكشف اليوم أسرار وحقائق ${tName}. ${tDesc}. رحلة سردية وثائقية تكشف التفاصيل الغامضة وتضع الحقائق أمام المشاهد.`;
+      }
     }
+    if (!effectiveScript || effectiveScript.length < 5) {
+      effectiveScript = "مشهد افتتاحي سينمائي مشوق يسلط الضوء على بداية الأحداث المثيرة وتفاصيلها المفصلية.";
+    }
+
     const provider = resolveEffectiveProvider(requestedProvider, req.body);
     const totalSec = Math.max(10, Number(actualDurationSec) || 180);
-    const scriptWords = script.trim().split(/\s+/).filter(Boolean);
+    const scriptWords = effectiveScript.split(/\s+/).filter(Boolean);
     const totalWordCount = scriptWords.length;
 
-    const byDuration = Math.round(totalSec / 5.2);
-    const byWords = Math.round(totalWordCount / 14);
-    const targetSceneCount = Math.max(8, Math.min(120, Math.max(byDuration, byWords)));
-    const maxWordsPerScene = Math.max(16, Math.ceil((totalWordCount / targetSceneCount) * 1.65));
+    const requestedPace = Number(req.body?.targetSecondsPerScene);
+    const paceSec = Math.max(4, Math.min(30, requestedPace || 10));
+    // Number of scenes directly tied to audio duration:
+    const targetSceneCount = Math.max(5, Math.min(80, Math.round(totalSec / paceSec)));
+    const maxWordsPerScene = Math.max(16, Math.ceil((totalWordCount / targetSceneCount) * 1.5));
 
     const corePromptRules = channelProfile?.promptRules || channelProfile?.visualStyleRules || "";
     const prompt = `Split the following approved voice-over script into a natural, dynamically-paced sequence of visual scenes synchronized with the narration.
@@ -2081,7 +2419,7 @@ Target Scene Count: Approximately ${targetSceneCount} scenes.
 
 APPROVED SCRIPT:
 """
-${script}
+${effectiveScript}
 """
 
 CRITICAL DYNAMIC TIMING & CONTINUITY RULES:
@@ -2096,78 +2434,121 @@ CRITICAL DYNAMIC TIMING & CONTINUITY RULES:
     let geminiResponse: any = null;
 
     if (provider === "external" || provider === "codecraft") {
-      const cc = getCodeCraftCreds(req.body);
-      const rawJson = await callCodeCraftChat({
-        apiKey: cc.apiKey,
-        baseUrl: cc.baseUrl,
-        model: cc.textModel,
-        prompt: `${prompt}\n\nReturn strictly valid JSON with key "scenes" containing an array of ~${targetSceneCount} scene objects with: scriptExcerpt, visualDescription, mainSubject, environment, emotionalTone, cameraFraming, transitionSuggestion.`,
-        jsonMode: true,
-      });
-      const parsed = parseJsonClean(rawJson);
-      rawScenes = Array.isArray(parsed)
-        ? parsed
-        : Array.isArray(parsed?.scenes)
-        ? parsed.scenes
-        : Array.isArray(parsed?.data)
-        ? parsed.data
-        : [];
+      try {
+        const cc = getCodeCraftCreds(req.body);
+        const rawJson = await callCodeCraftChat({
+          apiKey: cc.apiKey,
+          baseUrl: cc.baseUrl,
+          model: cc.textModel,
+          prompt: `${prompt}\n\nReturn strictly valid JSON with key "scenes" containing an array of ~${targetSceneCount} scene objects with: scriptExcerpt, visualDescription, mainSubject, environment, emotionalTone, cameraFraming, transitionSuggestion.`,
+          jsonMode: true,
+        });
+        const parsed = parseJsonClean(rawJson);
+        rawScenes = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray(parsed?.scenes)
+          ? parsed.scenes
+          : Array.isArray(parsed?.data)
+          ? parsed.data
+          : [];
+      } catch (ccErr: any) {
+        console.warn("[Scene Breakdown CodeCraft Error]:", ccErr?.message || ccErr);
+      }
     } else {
-      geminiResponse = await executeGeminiWithFailover(
-        (ai, _kIdx, _tot, modelToUse) =>
-          ai.models.generateContent({
-            model: modelToUse,
-            contents: prompt,
-            config: buildGeminiTextConfig(modelToUse, {
-              responseMimeType: "application/json",
-              responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                scenes: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      scriptExcerpt: { type: Type.STRING },
-                      visualDescription: { type: Type.STRING },
-                      mainSubject: { type: Type.STRING },
-                      environment: { type: Type.STRING },
-                      emotionalTone: { type: Type.STRING },
-                      cameraFraming: { type: Type.STRING },
-                      transitionSuggestion: { type: Type.STRING },
+      try {
+        geminiResponse = await executeGeminiWithFailover(
+          (ai, _kIdx, _tot, modelToUse) =>
+            ai.models.generateContent({
+              model: modelToUse,
+              contents: prompt,
+              config: buildGeminiTextConfig(modelToUse, {
+                responseMimeType: "application/json",
+                responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  scenes: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        scriptExcerpt: { type: Type.STRING },
+                        visualDescription: { type: Type.STRING },
+                        mainSubject: { type: Type.STRING },
+                        environment: { type: Type.STRING },
+                        emotionalTone: { type: Type.STRING },
+                        cameraFraming: { type: Type.STRING },
+                        transitionSuggestion: { type: Type.STRING },
+                      },
+                      required: ["scriptExcerpt", "visualDescription"],
                     },
-                    required: ["scriptExcerpt", "visualDescription"],
                   },
                 },
+                required: ["scenes"],
               },
-              required: ["scenes"],
-            },
+            }),
           }),
-        }),
-        req.body
-      );
-      const parsed = parseJsonClean(geminiResponse.text || "{}");
-      rawScenes = Array.isArray(parsed)
-        ? parsed
-        : Array.isArray(parsed?.scenes)
-        ? parsed.scenes
-        : [];
+          req.body
+        );
+        const parsed = parseJsonClean(geminiResponse?.text || "{}");
+        rawScenes = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray(parsed?.scenes)
+          ? parsed.scenes
+          : Array.isArray(parsed?.data?.scenes)
+          ? parsed.data.scenes
+          : Array.isArray(parsed?.data)
+          ? parsed.data
+          : [];
+      } catch (gemErr: any) {
+        console.warn("[Scene Breakdown Gemini Error, using smart sentence fallback]:", gemErr?.message || gemErr);
+      }
     }
 
-    if (!rawScenes.length) {
-      rawScenes = [
-        {
-          scriptExcerpt: script,
-          visualDescription: `${concept?.title || "Cinematic documentary scene"} — ${
-            channelProfile?.visualStyleRules || visualStylePreset?.name || "high detail visual"
-          }`,
-          mainSubject: concept?.title || "Narrator subject",
-          environment: "Cinematic environment",
-          emotionalTone: "Engaging",
-          cameraFraming: "wide shot",
-          transitionSuggestion: "fade",
-        },
-      ];
+    // High-fidelity fallback scene synthesis if model failed or returned insufficient scenes
+    if (!rawScenes || rawScenes.length < 3) {
+      const framingsList = ["wide shot", "medium shot", "close-up", "aerial establishing shot", "low-angle shot", "over-the-shoulder"];
+      const transitionsList = ["fade", "cut", "CrossZoom", "wipeleft", "ZoomIn"];
+      const styleName = channelProfile?.visualStyleRules || visualStylePreset?.name || "Cinematic Documentary";
+      const subjectTitle = concept?.title || req.body?.topicName || "Central Subject";
+
+      // Split effective script into sentences or clauses
+      let chunks = effectiveScript
+        .split(/(?<=[.!?؟\n])\s+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      if (chunks.length < targetSceneCount) {
+        chunks = effectiveScript
+          .split(/(?<=[.!?؟،—;,\n])\s+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+
+      if (chunks.length < targetSceneCount && scriptWords.length >= targetSceneCount) {
+        chunks = [];
+        const chunkSize = Math.max(8, Math.ceil(scriptWords.length / targetSceneCount));
+        for (let i = 0; i < scriptWords.length; i += chunkSize) {
+          chunks.push(scriptWords.slice(i, i + chunkSize).join(" "));
+        }
+      }
+
+      if (chunks.length === 0) {
+        chunks = [effectiveScript];
+      }
+
+      rawScenes = chunks.map((chunk, cIdx) => {
+        const framing = framingsList[cIdx % framingsList.length];
+        const transition = transitionsList[cIdx % transitionsList.length];
+        return {
+          scriptExcerpt: chunk,
+          visualDescription: `لقطة سينمائية عالية الدقة (${framing}) تجسد "${chunk.slice(0, 80)}" بأسلوب ${styleName} مع إضاءة درامية وعمق بصري واقعي.`,
+          mainSubject: subjectTitle,
+          environment: "Cinematic atmospheric environment with dramatic lighting",
+          emotionalTone: cIdx === 0 ? "Intriguing Hook" : (cIdx === chunks.length - 1 ? "Impactful Conclusion" : "Engaging Narrative"),
+          cameraFraming: framing,
+          transitionSuggestion: transition,
+        };
+      });
     }
 
     const balancedScenes: any[] = [];
@@ -2233,29 +2614,24 @@ CRITICAL DYNAMIC TIMING & CONTINUITY RULES:
       const txt = String(s.scriptExcerpt || "").trim();
       const wordCount = Math.max(1, txt.split(/\s+/).filter(Boolean).length);
       const pauseMarks = (txt.match(/(\.\.\.|[.!?؟،—;:]+)/g) || []).length;
-      const charFactor = Math.max(1, txt.length / 5.2);
-      return wordCount * 0.65 + charFactor * 0.35 + pauseMarks * 0.85;
+      return wordCount + pauseMarks * 0.8;
     });
     const totalWeight = sceneWeights.reduce((a: number, b: number) => a + b, 0) || 1;
 
-    let cursor = 0;
-    const minSceneDur = Math.max(1.8, Math.min(10, totalSec / finalRawScenes.length));
+    let cumWeight = 0;
     const timedScenes = finalRawScenes.map((s: any, idx: number) => {
       const isLast = idx === finalRawScenes.length - 1;
-      const startSec = idx === 0 ? 0 : Math.max(+(idx * 1.5).toFixed(1), cursor);
-      const rawDur = (sceneWeights[idx] / totalWeight) * totalSec;
-      const durationSec = isLast
-        ? Math.max(1.5, +(totalSec - startSec).toFixed(1))
-        : Math.max(minSceneDur, +rawDur.toFixed(1));
-      const endSec = isLast ? totalSec : +(startSec + durationSec).toFixed(1);
-      cursor = endSec;
+      const startSec = +( (cumWeight / totalWeight) * totalSec ).toFixed(1);
+      cumWeight += sceneWeights[idx];
+      const endSec = isLast ? totalSec : +( (cumWeight / totalWeight) * totalSec ).toFixed(1);
+      const duration = +(endSec - startSec).toFixed(1);
       return {
-        id: `scene_${Date.now()}_${idx + 1}`,
+        id: s.id || `scene_${Date.now()}_${idx + 1}`,
         sceneNumber: idx + 1,
         scriptExcerpt: s.scriptExcerpt,
         startTime: startSec,
         endTime: endSec,
-        duration: isLast ? Math.max(1.0, +(totalSec - startSec).toFixed(1)) : durationSec,
+        duration: isLast ? +(totalSec - startSec).toFixed(1) : duration,
         visualDescription: s.visualDescription,
         mainSubject: s.mainSubject,
         environment: s.environment,
@@ -2827,30 +3203,41 @@ app.post("/api/ai/seo-package", async (req, res) => {
     };
 
     const corePromptRules = channelProfile?.promptRules || channelProfile?.visualStyleRules || "";
+    const addScriptRules = channelProfile?.additionalScriptRules || "";
+    const addSceneRules = channelProfile?.additionalSceneRules || "";
     const thumbnailStyleRules = channelProfile?.thumbnailStyleRules || "";
     const artStyleRules = channelProfile?.visualStyleRules || channelProfile?.promptRules || "Cinematic visual storytelling";
     const avatarRules = channelProfile?.avatarCharacterDesc || "";
 
     const channelThumbContext = channelProfile
       ? `\n================================================================================
-🚨 SUPREME PRIORITY DIRECTIVE: REPLICATE CHANNEL VISUAL & THUMBNAIL STYLE 🚨
+🚨 SUPREME PRIORITY DIRECTIVE: STRICT CHANNEL COMPLIANCE & STYLE REPLICATION 🚨
 ================================================================================
-SELECTED CHANNEL PROFILE FOR YOUTUBE SEO & THUMBNAILS:
+SELECTED CHANNEL PROFILE FOR YOUTUBE SEO & THUMBNAIL CREATION:
 - Channel Name: ${channelProfile.name || "Active Channel"}
 - Channel Niche: ${channelProfile.niche || "Documentary"}
-- Channel Aspect Ratio: 16:9
 
-[1. CHANNEL CORE PROMPT RULES & ART STYLE (MANDATORY)]:
+[1. MASTER CHANNEL PROMPT RULES (MANDATORY)]:
 """
 ${corePromptRules || artStyleRules}
 """
 
-[2. CHANNEL THUMBNAIL COMPOSITION & STYLE RULES (MANDATORY)]:
+[2. ADDITIONAL SCRIPT & NARRATION RULES]:
+"""
+${addScriptRules || "Engaging voice-over, strong pacing, clear hooks."}
+"""
+
+[3. ADDITIONAL SCENE & VISUAL RULES]:
+"""
+${addSceneRules || "Cinematic visual pacing and varied framing."}
+"""
+
+[4. CHANNEL THUMBNAIL COMPOSITION & STYLE RULES (MANDATORY)]:
 """
 ${thumbnailStyleRules || "High-contrast focal subject, strong curiosity gap, expressive lighting, bold 2-4 word hook text"}
 """
 
-${avatarRules ? `[3. CHANNEL AVATAR / CHARACTER VISUAL CONTINUITY]:\n"""\n${avatarRules}\n"""\n` : ""}
+${avatarRules ? `[5. CHANNEL AVATAR / CHARACTER VISUAL CONTINUITY]:\n"""\n${avatarRules}\n"""\n` : ""}
 `
       : "";
 
@@ -3321,6 +3708,291 @@ Return strictly valid JSON with key: "thumbnails" (array of 3 objects with {id, 
     res.json(resultObj);
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to regenerate thumbnail prompts." });
+  }
+});
+
+// 10. AI Auto Caption Effects (Overlays & Reactions)
+app.post("/api/ai/caption-effects", async (req, res) => {
+  try {
+    const {
+      cues = [],
+      videoTitle = "",
+      channelNiche = "",
+      language = "auto",
+      provider: requestedProvider,
+    } = req.body || {};
+
+    if (!Array.isArray(cues) || cues.length === 0) {
+      return res.status(400).json({ error: "No caption cues provided." });
+    }
+
+    const provider = resolveEffectiveProvider(requestedProvider, req.body);
+
+    const formattedCues = cues
+      .slice(0, 100)
+      .map((c: any, idx: number) => `[${idx}] (${Number(c.start || 0).toFixed(2)}s - ${Number(c.end || 0).toFixed(2)}s): "${String(c.text || "").trim()}"`)
+      .join("\n");
+
+    const prompt = `You are a professional YouTube Video Editor specializing in high-retention visual editing (MrBeast, Alex Hormozi, Vox, Iman Gadzhi).
+Analyze the following timestamped subtitle transcript of a video and generate 4 to 12 high-impact visual text overlays ("AI Auto Caption Effects").
+
+CRITICAL RULES:
+1. Every overlay MUST be strictly grounded in the actual spoken meaning of the transcript. NEVER invent facts, contradict the narration, or add random unrelated reactions.
+2. Overlay Categories to generate:
+   - "reaction": WOW!, OH NO!, WAIT!, UNBELIEVABLE!, NO WAY!, WAIT WHAT?! (used at moments of shock, sudden turn, or amazement)
+   - "number": Key statistics, percentages, or money (e.g. "$1,000,000", "500%", "3.5 BILLION", "10X", "48 HOURS")
+   - "keyword": Single high-impact power words (e.g. "DANGER", "SECRET", "CRITICAL", "MASSIVE", "TRUTH", "WARNING")
+   - "revelation": Key turning points (e.g. "THE REAL TRUTH", "IT WAS A LIE", "THE TURNING POINT")
+   - "emphasis": Short focus phrases (e.g. "PAY ATTENTION", "LOOK AT THIS", "NEVER FORGET")
+3. Text must be punchy (1 to 4 words max), in uppercase, matching the video language (${language || "same as captions"}).
+4. Timestamps:
+   - "start": exact second timestamp (float) within the cue where the moment happens.
+   - "end": "start" + 1.2s to 2.2s.
+   - Space overlays apart (at least 6-15 seconds between overlays). Do not overcrowd the video.
+5. "animation": one of ["spring_bounce", "word_pop", "glitch_flicker", "zoom", "pop", "slide", "glow"].
+6. "style": one of ["beast", "hormozi", "vox", "magnates", "cyber", "alert"].
+   - "beast": MrBeast 3D comic with extruded shadow and comic sticker badge
+   - "hormozi": Alex Hormozi high-retention black box with bright neon punch
+   - "vox": Vox documentary bar with warm golden marker underline
+   - "cyber": Glowing HUD data stats pill with tech border for numbers
+   - "magnates": 24K gold luxury noir with metallic gradient
+   - "alert": High-voltage red/amber warning hazard for critical moments
+7. "emoji": single high-impact emoji sticker (e.g. "💥", "🔥", "😱", "💰", "📈", "🚨", "⚠️", "💡", "⚡")
+8. "color": high-contrast hex code (e.g. "#FFE600", "#00FF66", "#00F0FF", "#FF1E56", "#F59E0B").
+9. "position": screen vertical position percent from bottom (35 to 75; 64-72 for upper reactions, 54-58 for center stats, 48-52 for lower-mid emphasis).
+
+Video Title: ${videoTitle || "YouTube Video"}
+Niche: ${channelNiche || "General"}
+
+Transcript Cues:
+"""
+${formattedCues}
+"""
+
+Return strictly valid JSON with an array named "overlays".
+Each overlay item must have:
+- text (string)
+- start (number)
+- end (number)
+- category (string: "reaction" | "number" | "keyword" | "revelation" | "emphasis")
+- animation (string)
+- style (string)
+- emoji (string)
+- color (string)
+- position (number)`;
+
+    let generatedOverlays: any[] = [];
+
+    if (provider === "external" || provider === "codecraft") {
+      try {
+        const cc = getCodeCraftCreds(req.body);
+        const rawJson = await callCodeCraftChat({
+          apiKey: cc.apiKey,
+          baseUrl: cc.baseUrl,
+          model: cc.textModel,
+          prompt: `${prompt}\n\nReturn strictly valid JSON: {"overlays": [...]}.`,
+          jsonMode: true,
+        });
+        const parsed = parseJsonClean(rawJson);
+        if (Array.isArray(parsed?.overlays)) {
+          generatedOverlays = parsed.overlays;
+        }
+      } catch (err) {
+        console.warn("External caption-effects failed, using fallback:", err);
+      }
+    } else {
+      try {
+        const response = await executeGeminiWithFailover(
+          (ai, _kIdx, _tot, modelToUse) =>
+            ai.models.generateContent({
+              model: modelToUse,
+              contents: [{ role: "user", parts: [{ text: prompt }] }],
+              config: buildGeminiTextConfig(modelToUse, {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    overlays: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          text: { type: Type.STRING },
+                          start: { type: Type.NUMBER },
+                          end: { type: Type.NUMBER },
+                          category: { type: Type.STRING },
+                          animation: { type: Type.STRING },
+                          style: { type: Type.STRING },
+                          emoji: { type: Type.STRING },
+                          color: { type: Type.STRING },
+                          position: { type: Type.NUMBER },
+                        },
+                        required: ["text", "start", "end", "category"],
+                      },
+                    },
+                  },
+                  required: ["overlays"],
+                },
+              }),
+            }),
+          req.body
+        );
+        const parsed = parseJsonClean(response.text || "{}");
+        if (Array.isArray(parsed?.overlays)) {
+          generatedOverlays = parsed.overlays;
+        }
+      } catch (geminiErr) {
+        console.warn("Gemini caption-effects failed, falling back to heuristic:", geminiErr);
+      }
+    }
+
+    if (!Array.isArray(generatedOverlays) || generatedOverlays.length === 0) {
+      generatedOverlays = generateHeuristicOverlays(cues);
+    }
+
+    const finalOverlays = generatedOverlays
+      .map((ov: any, idx: number) => {
+        const s = typeof ov.start === "number" ? Math.max(0, +ov.start.toFixed(2)) : 0;
+        const e = typeof ov.end === "number" && ov.end > s ? Math.max(s + 1, +ov.end.toFixed(2)) : +(s + 1.8).toFixed(2);
+        return {
+          id: ov.id || `ai_eff_${Date.now()}_${idx}`,
+          text: String(ov.text || "").trim().slice(0, 45) || "WOW!",
+          start: s,
+          end: e,
+          category: ["reaction", "number", "keyword", "revelation", "emphasis"].includes(ov.category)
+            ? ov.category
+            : "emphasis",
+          animation: ["spring_bounce", "word_pop", "glitch_flicker", "zoom", "pop", "slide", "glow"].includes(ov.animation)
+            ? ov.animation
+            : "spring_bounce",
+          style: ["beast", "hormozi", "vox", "magnates", "cyber", "alert"].includes(ov.style)
+            ? ov.style
+            : "beast",
+          emoji: typeof ov.emoji === "string" ? ov.emoji.slice(0, 4) : undefined,
+          color: ov.color && /^#[0-9A-Fa-f]{6}$/.test(ov.color) ? ov.color : undefined,
+          position: typeof ov.position === "number" ? Math.max(25, Math.min(80, Math.round(ov.position))) : 54,
+          approved: true,
+        };
+      })
+      .sort((a: any, b: any) => a.start - b.start);
+
+    res.json({
+      ok: true,
+      overlays: finalOverlays,
+      count: finalOverlays.length,
+    });
+  } catch (err: any) {
+    console.error("POST /api/ai/caption-effects error:", err);
+    res.status(500).json({ error: err.message || "Failed to generate AI caption effects." });
+  }
+});
+
+// --- Cloud SQL (PostgreSQL) Online Database Endpoints ---
+app.get("/api/db/status", async (_req, res) => {
+  try {
+    const hasConfig = Boolean(process.env.SQL_HOST && process.env.SQL_DB_NAME);
+    res.json({
+      ok: true,
+      online: true,
+      provider: "Cloud SQL (PostgreSQL)",
+      configured: hasConfig,
+      database: process.env.SQL_DB_NAME || "cloudsql",
+      host: process.env.SQL_HOST || "localhost",
+    });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message || "Database status check failed." });
+  }
+});
+
+app.get("/api/db/projects", async (_req, res) => {
+  try {
+    const list = await listProjectsSql();
+    res.json(list);
+  } catch (err: any) {
+    console.error("GET /api/db/projects error:", err);
+    res.status(500).json({ error: err.message || "Failed to load projects from Cloud SQL." });
+  }
+});
+
+app.get("/api/db/projects/:id", async (req, res) => {
+  try {
+    const project = await getProjectSql(req.params.id);
+    if (!project) return res.status(404).json({ error: "Project not found." });
+    res.json(project);
+  } catch (err: any) {
+    console.error("GET /api/db/projects/:id error:", err);
+    res.status(500).json({ error: err.message || "Failed to get project from Cloud SQL." });
+  }
+});
+
+app.post("/api/db/projects", async (req, res) => {
+  try {
+    const saved = await saveProjectSql(req.body);
+    res.json(saved);
+  } catch (err: any) {
+    console.error("POST /api/db/projects error:", err);
+    res.status(500).json({ error: err.message || "Failed to save project to Cloud SQL." });
+  }
+});
+
+app.patch("/api/db/projects/:id/rename", async (req, res) => {
+  try {
+    const result = await renameProjectSql(req.params.id, String(req.body.name || "Untitled"));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to rename project." });
+  }
+});
+
+app.patch("/api/db/projects/:id/archive", async (req, res) => {
+  try {
+    const result = await archiveProjectSql(req.params.id, Boolean(req.body.archived));
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to archive project." });
+  }
+});
+
+app.post("/api/db/projects/:id/duplicate", async (req, res) => {
+  try {
+    const cloned = await duplicateProjectSql(req.params.id);
+    if (!cloned) return res.status(404).json({ error: "Original project not found." });
+    res.json(cloned);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to duplicate project." });
+  }
+});
+
+app.delete("/api/db/projects/:id", async (req, res) => {
+  try {
+    await deleteProjectSql(req.params.id);
+    res.json({ ok: true, deleted: req.params.id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to delete project." });
+  }
+});
+
+app.get("/api/db/settings", async (_req, res) => {
+  try {
+    const settings = await getGlobalSettingsSql();
+    res.json(settings || {});
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to load settings." });
+  }
+});
+
+app.post("/api/db/settings", async (req, res) => {
+  try {
+    const saved = await saveGlobalSettingsSql(req.body);
+    if (req.body?.aiSettings?.geminiApiKeys) {
+      const incoming = parseKeysString(req.body.aiSettings.geminiApiKeys);
+      if (incoming.length > 0) {
+        runtimeGeminiConfig.apiKeys = Array.from(new Set([...runtimeGeminiConfig.apiKeys, ...incoming]));
+      }
+    }
+    res.json(saved);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to save settings." });
   }
 });
 

@@ -312,9 +312,12 @@ export function createDefaultNarrativeData(globalSettings = null) {
       seo: false,
     },
     reference: {
+      mode: "youtube", // "youtube" | "topic"
       youtubeUrl: "",
       videoId: "",
       title: "",
+      topicName: "",
+      topicDescription: "",
       author: "",
       description: "",
       duration: "",
@@ -419,25 +422,23 @@ export function recalculateSceneTimings(scenes, totalDurationSec) {
     const txt = String(s.scriptExcerpt || "").trim();
     const wordCount = Math.max(1, txt.split(/\s+/).filter(Boolean).length);
     const pauseMarks = (txt.match(/(\.\.\.|[.!?؟،—;:]+)/g) || []).length;
-    const charFactor = Math.max(1, txt.length / 5.2);
-    return wordCount * 0.65 + charFactor * 0.35 + pauseMarks * 0.85;
+    return wordCount + pauseMarks * 0.8;
   });
   const sumWeights = weights.reduce((a, b) => a + b, 0) || 1;
 
-  let cursor = 0;
+  let cumWeight = 0;
   return scenes.map((s, idx) => {
     const isLast = idx === scenes.length - 1;
-    const startTime = idx === 0 ? 0 : cursor;
-    const rawDur = (weights[idx] / sumWeights) * totalSec;
-    const endTime = isLast ? totalSec : Math.min(totalSec, +(startTime + rawDur).toFixed(1));
-    const duration = Math.max(1.2, +(endTime - startTime).toFixed(1));
-    cursor = +(startTime + duration).toFixed(1);
+    const startTime = +( (cumWeight / sumWeights) * totalSec ).toFixed(1);
+    cumWeight += weights[idx];
+    const endTime = isLast ? totalSec : +( (cumWeight / sumWeights) * totalSec ).toFixed(1);
+    const duration = +(endTime - startTime).toFixed(1);
     return {
       ...s,
       sceneNumber: idx + 1,
       startTime,
-      endTime: isLast ? totalSec : cursor,
-      duration: isLast ? Math.max(1.0, +(totalSec - startTime).toFixed(1)) : duration,
+      endTime,
+      duration: isLast ? +(totalSec - startTime).toFixed(1) : duration,
     };
   });
 }

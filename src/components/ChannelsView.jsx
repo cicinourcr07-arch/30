@@ -7,12 +7,14 @@ import {
   transitionOf,
   MIN_TRANSITION_DURATION,
   MAX_TRANSITION_DURATION,
+  TRENDING_AUTOMATION_PICKS,
 } from "../lib/transitions";
 import {
   CAPTION_STYLE_LIST,
   CAPTION_FONTS,
   CAPTION_PRESET_COLORS,
   CAPTION_ANIMATIONS,
+  CAPTION_VIRAL_PRESETS,
   captionFontFamily,
   drawCaption,
 } from "../lib/captions";
@@ -84,12 +86,12 @@ export default function ChannelsView({
   const activeChannel =
     draft.channels.find((c) => c.id === selectedChannelId) || draft.channels[0] || null;
 
-  const defaultMixPool = ["fade", "wipeleft", "wiperight", "slideleft", "circleopen", "zoomin"];
+  const defaultMixPool = TRENDING_AUTOMATION_PICKS;
 
   const defaultEditorCfg = {
-    transitionType: "fade",
+    transitionType: "mix",
     transitionMixPool: defaultMixPool,
-    transitionDuration: 0.4,
+    transitionDuration: 0.35,
     motionMode: "alternate",
     motionAmount: 0.08,
     effectId: "cinema",
@@ -97,12 +99,12 @@ export default function ChannelsView({
     fadeIn: 0.5,
     fadeOut: 0.6,
     captionsOn: true,
-    captionStyle: "classic",
+    captionStyle: "hormozi",
     captionFont: "montserrat",
-    captionColor: "#FFFFFF",
-    captionAnimation: "pop",
-    captionSize: "md",
-    captionPosition: 0,
+    captionColor: "#FFE600",
+    captionAnimation: "spring_bounce",
+    captionSize: "lg",
+    captionPosition: 25,
   };
 
   const edCfg = {
@@ -1112,6 +1114,39 @@ export default function ChannelsView({
                       />
                     </div>
 
+                    {/* 🔥 Viral Automation Presets Quick Bar */}
+                    <div className="uyns-card space-y-2">
+                      <div className="text-xs font-bold text-[var(--text-pure)] flex items-center justify-between">
+                        <span>🔥 {isAr ? "قوالب ترند YouTube Automation (نقرة واحدة)" : "Viral Trend Caption Presets (1-Click)"}</span>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                        {CAPTION_VIRAL_PRESETS.map((pr) => (
+                          <button
+                            key={pr.id}
+                            type="button"
+                            onClick={() =>
+                              updateEditorConfig({
+                                captionStyle: pr.style,
+                                captionAnimation: pr.animation,
+                                captionColor: pr.color,
+                                captionFont: pr.font,
+                                captionSize: pr.size,
+                                captionPosition: pr.position,
+                              })
+                            }
+                            className={`p-2 rounded-lg text-left border transition-all text-xs ${
+                              edCfg.captionStyle === pr.style
+                                ? "border-[#3b82f6] bg-[var(--panel-2)] shadow-sm"
+                                : "border-[var(--line)] bg-[var(--bg)] hover:border-[var(--line-strong)]"
+                            }`}
+                          >
+                            <div className="font-bold text-[var(--text-pure)]">{isAr ? pr.nameAr : pr.name}</div>
+                            <div className="text-[10px] text-[var(--muted)] truncate">{pr.desc}</div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
                     <div className="trgrid">
                       {CAPTION_STYLE_LIST.map((s) => (
                         <CaptionStyleTile
@@ -1359,20 +1394,36 @@ export default function ChannelsView({
                                 ? `انقر على البطاقات بالأسفل لاختيار أو إلغاء الانتقالات ضمن الخلط (${mixPool.length} مختارة):`
                                 : `Click transition tiles below to toggle them in your random mix pool (${mixPool.length} selected):`}
                             </span>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                updateEditorConfig({
-                                  transitionType: "mix",
-                                  transitionMixPool: TRANSITION_LIST.filter(
-                                    (t) => t.id !== "cut"
-                                  ).map((t) => t.id),
-                                })
-                              }
-                              className="text-[#3b82f6] font-bold hover:underline"
-                            >
-                              {isAr ? "تحديد الكل" : "Select All"}
-                            </button>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateEditorConfig({
+                                    transitionType: "mix",
+                                    transitionMixPool: TRENDING_AUTOMATION_PICKS,
+                                  })
+                                }
+                                className="text-amber-400 font-bold hover:underline flex items-center gap-1"
+                                title="اختيار خلطة انتقالات الترند الموصى بها"
+                              >
+                                <span>🔥 {isAr ? "خلطة الترند" : "Viral Mix"}</span>
+                              </button>
+                              <span className="text-[var(--line)]">·</span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateEditorConfig({
+                                    transitionType: "mix",
+                                    transitionMixPool: TRANSITION_LIST.filter(
+                                      (t) => t.id !== "cut"
+                                    ).map((t) => t.id),
+                                  })
+                                }
+                                className="text-[#3b82f6] font-bold hover:underline"
+                              >
+                                {isAr ? "تحديد الكل" : "Select All"}
+                              </button>
+                            </div>
                           </div>
                           <div className="flex flex-wrap gap-1.5">
                             {mixPool.map((id) => {

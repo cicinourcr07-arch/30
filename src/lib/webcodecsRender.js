@@ -39,7 +39,7 @@ class ChunkedBuffer {
   }
 }
 
-import { captionAt, captionCueAt, drawCaption, captionFontPx, captionFontFamily } from "./captions";
+import { captionAt, captionCueAt, drawCaption, captionFontPx, captionFontFamily, drawCaptionOverlay } from "./captions";
 import { applyEffect } from "./effects";
 import { transitionOf } from "./transitions";
 import { createVideoSource } from "./videoDecodeSource";
@@ -319,6 +319,7 @@ export async function renderWebCodecs(spec, imagesByName, onProgress, shouldCanc
     cues = null, captionStyle = "classic", captionColor = null, captionAnimation = "pop",
     captionSize = "md", captionLineHeight = 0, captionFontScale = 1,
     captionFont = "default", captionPosition = "bottom",
+    captionEffects = [], captionEffectsOn = true,
     effectId = "none", effectIntensity = 0.5, effectByName = {}, sfx = [],
     videosByName = {}, trims = [], speeds = [], volumes = [], bitrate = 8_000_000 } = spec;
   // The render profile decides container + codecs (H.264/AAC MP4, or VP9/Opus WebM
@@ -785,6 +786,16 @@ export async function renderWebCodecs(spec, imagesByName, onProgress, shouldCanc
             end: cue.end,
           }
         );
+      }
+    }
+
+    // AI Auto Caption Effects / Text Overlays
+    if (captionEffectsOn !== false && captionEffects && captionEffects.length) {
+      const sceneCtx = { aspect: W < H ? "9:16" : "16:9" };
+      for (const ov of captionEffects) {
+        if (ov.approved !== false && t >= ov.start && t < ov.end) {
+          drawCaptionOverlay(ctx, ov, W, H, t, capFamily, sceneCtx);
+        }
       }
     }
 

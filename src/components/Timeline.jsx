@@ -35,6 +35,8 @@ export default function Timeline({
   transitionsByName, motionByName, selectedName, onSelect,
   onSeek, onScrubStart, onScrubEnd, onOpen, onAdd, onResizeBoundary,
   trimEnd, onTrimChange,
+  captionEffects = [], captionEffectsOn = true,
+  selectedOverlayId, onOverlaySelect, onOverlayMove,
   sfx = [], onSfxAdd, onSfxMove, onSfxOpen,
 }) {
   const trackRef = useRef(null);
@@ -173,6 +175,39 @@ export default function Timeline({
     window.addEventListener("pointerup", up);
   }, [sfxTimeAt, onSfxMove, onSfxOpen]);
 
+  // Drag an overlay to move it along timeline; a click seeks and selects it.
+  const onOverlayDown = useCallback((e, id) => {
+    e.stopPropagation();
+    const el = trackRef.current;
+    if (!el || !duration) return;
+    const ov = (captionEffects || []).find((x) => x.id === id);
+    if (!ov) return;
+    const ovDur = Math.max(0.4, (ov.end || ov.start + 1.2) - ov.start);
+    const startX = e.clientX;
+    const origStart = ov.start;
+    let moved = false;
+    const move = (ev) => {
+      const dx = ev.clientX - startX;
+      if (!moved && Math.abs(dx) > 4) moved = true;
+      if (moved && onOverlayMove) {
+        const r = el.getBoundingClientRect();
+        const deltaSec = (dx / r.width) * duration;
+        const newStart = Math.max(0, Math.min(duration - ovDur, origStart + deltaSec));
+        onOverlayMove(id, newStart);
+      }
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (!moved) {
+        if (onSeek) onSeek(ov.start);
+        if (onOverlaySelect) onOverlaySelect(id);
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }, [captionEffects, duration, onOverlayMove, onOverlaySelect, onSeek]);
+
   // A clip opens the inspector only on a clean tap, not a drag/scroll.
   const onClipClick = useCallback((name, e) => {
     const d = downRef.current;
@@ -240,6 +275,9 @@ export default function Timeline({
           <span className="tl__tag">V</span>
           <span className="tl__tag tl__tag--audio">A</span>
           <span className="tl__tag tl__tag--fx">FX</span>
+          {captionEffects && captionEffects.length > 0 && (
+            <span className="tl__tag tl__tag--txt" title="AI Text Effects">TXT</span>
+          )}
         </div>
 
         <div className="tl__track" ref={trackRef}>
@@ -331,6 +369,42 @@ export default function Timeline({
               </button>
             ))}
           </div>
+
+          {captionEffects && captionEffects.length > 0 && (
+            <div
+              className={`tl__lane tl__lane--text-effects ${captionEffectsOn === false ? "is-disabled" : ""}`}
+              title="AI Text Effects Overlays — click to seek, drag to retime"
+            >
+              {captionEffects.map((ov) => {
+                const ovStart = ov.start;
+                const ovDur = Math.max(0.4, (ov.end || ov.start + 1.2) - ovStart);
+                const isSelected = selectedOverlayId === ov.id;
+                const isApproved = ov.approved !== false;
+                const catColor = ov.category === "reaction" ? "#FFE600"
+                  : ov.category === "number" ? "#00FF66"
+                  : ov.category === "keyword" ? "#00F0FF"
+                  : ov.category === "revelation" ? "#F59E0B"
+                  : "#FF2A85";
+
+                return (
+                  <div
+                    key={ov.id}
+                    className={`tl__ov-block ${isSelected ? "is-selected" : ""} ${isApproved ? "" : "is-unapproved"}`}
+                    style={{
+                      left: pct(ovStart),
+                      width: pct(ovDur),
+                      borderLeftColor: catColor,
+                    }}
+                    title={`[${ov.category}] "${ov.text}" (${label(ovStart)} - ${label(ov.end)}) — drag to move`}
+                    onPointerDown={(e) => onOverlayDown(e, ov.id)}
+                  >
+                    <span className="tl__ov-cat" style={{ color: catColor }}>{ov.category || "TXT"}</span>
+                    <span className="tl__ov-text">{ov.text}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           <div className="tl__playhead" style={{ left: pct(time) }}>
             <span className="tl__playhead-grip" />

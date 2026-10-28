@@ -20,7 +20,33 @@ export default function CaptionStyleTile({ st, color, fontFamily, on, onClick })
   }, [st.id, fontFamily, color]);
 
   return (
-    <button type="button" className={`captile ${on ? "is-on" : ""}`} onClick={onClick} title={st.label}>
+    <button
+      type="button"
+      className={`captile ${on ? "is-on" : ""}`}
+      onClick={onClick}
+      title={`${st.label}${st.labelAr ? " / " + st.labelAr : ""}`}
+      style={{ position: "relative" }}
+    >
+      {st.badge && (
+        <span
+          style={{
+            position: "absolute",
+            top: 4,
+            right: 4,
+            fontSize: "9px",
+            fontWeight: "800",
+            padding: "2px 5px",
+            borderRadius: "4px",
+            background: st.badge.includes("TREND") ? "#ef4444" : "rgba(30, 41, 59, 0.85)",
+            color: "#ffffff",
+            letterSpacing: "0.5px",
+            zIndex: 2,
+            boxShadow: "0 2px 4px rgba(0,0,0,0.4)",
+          }}
+        >
+          {st.badge}
+        </span>
+      )}
       <canvas ref={ref} width={140} height={140} className="captile__cv" />
       <span className="captile__label">{st.label}</span>
     </button>

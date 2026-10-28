@@ -24,6 +24,7 @@ export function DialogHost() {
   const [state, setState] = useState(null);
   const [value, setValue] = useState("");
   const inputRef = useRef(null);
+  const buttonRef = useRef(null);
 
   const [copied, setCopied] = useState(false);
   useEffect(() => { emit = setState; return () => { emit = null; }; }, []);
@@ -31,7 +32,16 @@ export function DialogHost() {
     if (!state) return;
     setCopied(false);
     if (state.type === "prompt") setValue(state.defaultValue || "");
-    const t = setTimeout(() => { if (inputRef.current) { inputRef.current.focus(); inputRef.current.select(); } }, 0);
+    const t = setTimeout(() => {
+      if (state.type === "prompt" && inputRef.current) {
+        inputRef.current.focus();
+        if (typeof inputRef.current.select === "function") {
+          inputRef.current.select();
+        }
+      } else if (buttonRef.current) {
+        buttonRef.current.focus();
+      }
+    }, 0);
     return () => clearTimeout(t);
   }, [state]);
   const copyDetails = async () => {
@@ -78,7 +88,7 @@ export function DialogHost() {
             <button className="dlg__btn" onClick={onCancel}>{state.cancelText || "Cancel"}</button>
           )}
           <button
-            ref={state.type === "alert" ? inputRef : null}
+            ref={buttonRef}
             className={`dlg__btn ${state.danger ? "dlg__btn--danger" : "dlg__btn--primary"}`}
             onClick={onOk}
           >

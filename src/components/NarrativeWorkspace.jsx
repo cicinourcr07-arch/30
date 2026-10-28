@@ -19,6 +19,7 @@ import {
   generateImagePromptsBatch,
   generateMotionPromptsBatch,
   generateSeoPackage,
+  getStoredGeminiKeys,
 } from "../lib/aiService";
 import { compressImageFile } from "../lib/imageUtils";
 import { showAlert, showConfirm, showPrompt } from "./Dialog";
@@ -27,6 +28,7 @@ import ChannelsView from "./ChannelsView";
 import {
   Play,
   Home,
+  Clock,
   FolderPlus,
   Folders,
   Settings,
@@ -57,6 +59,7 @@ import {
   RotateCcw,
   RotateCw,
   KeyRound,
+  Lightbulb,
 } from "lucide-react";
 
 export default function NarrativeWorkspace({
@@ -175,7 +178,7 @@ export default function NarrativeWorkspace({
     channels[0] ||
     null;
 
-  const [scenePaceSec, setScenePaceSec] = useState(5);
+  const [scenePaceSec, setScenePaceSec] = useState(10);
 
   const copyToClipboard = async (text, id) => {
     try {
@@ -259,23 +262,44 @@ export default function NarrativeWorkspace({
 
   const handleAnalyzeAndContinue = async () => {
     const ref = narrative.reference || {};
-    if (!ref.youtubeUrl?.trim() && !ref.title?.trim() && !ref.pastedTranscript?.trim()) {
-      setStageError(
-        isAr
-          ? "يرجى إدخال رابط فيديو يوتيوب أو عنوان مرجعي للبدء في التحليل."
-          : "Please enter a YouTube URL, reference title, or transcript to analyze."
-      );
-      return;
+    const topicInput = (ref.topicName || ref.title || "").trim();
+    const urlInput = (ref.youtubeUrl || "").trim();
+    const mode = topicInput ? "topic" : (urlInput ? "youtube" : (ref.mode || "topic"));
+
+    if (mode === "youtube") {
+      if (!ref.youtubeUrl?.trim() && !ref.title?.trim() && !ref.pastedTranscript?.trim()) {
+        setStageError(
+          isAr
+            ? "يرجى إدخال رابط فيديو يوتيوب صحيح للبدء في التحليل."
+            : "Please enter a valid YouTube URL to begin analysis."
+        );
+        return;
+      }
+    } else {
+      const topic = (ref.topicName || ref.title || "").trim();
+      if (!topic) {
+        setStageError(
+          isAr
+            ? "يرجى كتابة اسم الموضوع أو فكرة الفيديو للبدء (الوصف اختياري)."
+            : "Please enter the topic name or video subject to proceed (description is optional)."
+        );
+        return;
+      }
     }
+
     setBusyMsg(
       isAr
-        ? "جاري تحليل المرجع والصورة المصغرة وتوليد 5 أفكار أصلية..."
+        ? mode === "topic"
+          ? "جاري تحليل فكرة الموضوع وبناء الستايل البصري وتوليد 5 أفكار متميزة..."
+          : "جاري تحليل المرجع والصورة المصغرة وتوليد 5 أفكار أصلية..."
+        : mode === "topic"
+        ? "Analyzing topic, crafting visual style lock, and generating 5 original concepts..."
         : "Analyzing reference & thumbnail vision and generating 5 original concepts..."
     );
     setStageError(null);
     try {
       let meta = {};
-      if (ref.youtubeUrl?.trim() && !ref.thumbnailBase64) {
+      if (mode === "youtube" && ref.youtubeUrl?.trim() && !ref.thumbnailBase64) {
         try {
           meta = await fetchYouTubeMetadata(ref.youtubeUrl.trim());
         } catch (metaErr) {
@@ -283,11 +307,25 @@ export default function NarrativeWorkspace({
           throw metaErr;
         }
       }
+
+      const effectiveTitle =
+        mode === "topic"
+          ? (ref.topicName || ref.title || "").trim()
+          : (ref.title || meta.title || "");
+
+      const effectiveDescription =
+        mode === "topic"
+          ? (ref.topicDescription !== undefined ? ref.topicDescription : (ref.description || "")).trim()
+          : (meta.description || ref.description || "");
+
       const mergedRef = {
         ...ref,
-        title: ref.title || meta.title || "",
-        author: meta.author || ref.author || "",
-        description: meta.description || ref.description || "",
+        mode,
+        title: effectiveTitle,
+        topicName: effectiveTitle,
+        description: effectiveDescription,
+        topicDescription: effectiveDescription,
+        author: mode === "topic" ? (activeChannel?.name || "Original Topic") : (meta.author || ref.author || ""),
         duration: meta.duration || ref.duration || "",
         views: meta.views || ref.views || "",
         thumbnailUrl: ref.thumbnailUrl || meta.thumbnailUrl || "",
@@ -296,20 +334,41 @@ export default function NarrativeWorkspace({
         notice: meta.notice || ref.notice || "",
       };
 
+      // Auto-update project name if default
+      if (
+        effectiveTitle &&
+        (!currentProject?.name ||
+          currentProject.name === "My Awesome Project" ||
+          currentProject.name === "مشروع جديد")
+      ) {
+        onRenameProject(effectiveTitle, true);
+      }
+
       const aiRes = await analyzeReferenceAndConcepts({
-        projectName: currentProject?.name || "My Awesome Project",
-        youtubeUrl: mergedRef.youtubeUrl,
-        referenceTitle: mergedRef.title,
+        projectName: currentProject?.name || effectiveTitle || "My Awesome Project",
+        referenceMode: mode,
+        youtubeUrl: mode === "youtube" ? mergedRef.youtubeUrl : "",
+        referenceTitle: effectiveTitle,
+        topicName: effectiveTitle,
+        description: effectiveDescription,
+        topicDescription: effectiveDescription,
         channelName: mergedRef.author,
-        description: mergedRef.description,
         pastedTranscript: mergedRef.pastedTranscript,
-        nichePreference: mergedRef.nichePreference,
+        nichePreference: mergedRef.nichePreference || activeChannel?.niche,
+        channelNiche: activeChannel?.niche,
         languagePreference: mergedRef.languagePreference,
         thumbnailBase64: mergedRef.thumbnailBase64,
         thumbnailMime: mergedRef.thumbnailMime,
         provider: textProvider,
         codecraftConfig: codecraftCfg,
       });
+
+      const allConcepts = Array.isArray(aiRes.concepts) ? aiRes.concepts : [];
+      const userOriginalConcept =
+        aiRes.userConcept ||
+        allConcepts.find((c) => c.isUserOriginal || c.id === "user-original-concept") ||
+        allConcepts[0] ||
+        null;
 
       updateNarrative((prev) => ({
         ...prev,
@@ -319,9 +378,10 @@ export default function NarrativeWorkspace({
           ...(aiRes.visualStyleLock || prev.visualStyleLock),
           approved: true,
         },
-        concepts: aiRes.concepts || [],
-        selectedConceptId: aiRes.concepts?.[0]?.id || null,
-        selectedConcept: aiRes.concepts?.[0] || null,
+        userConcept: userOriginalConcept,
+        concepts: allConcepts,
+        selectedConceptId: userOriginalConcept?.id || allConcepts[0]?.id || null,
+        selectedConcept: userOriginalConcept || allConcepts[0] || null,
         currentStage: 2,
         maxUnlockedStage: Math.max(prev.maxUnlockedStage || 1, 2),
       }));
@@ -358,18 +418,74 @@ export default function NarrativeWorkspace({
     }));
   };
 
+  const handleEditConcept = async (concept, idx) => {
+    const newTitle = await showPrompt(
+      isAr ? "تعديل عنوان الفكرة:" : "Edit Concept Title:",
+      {
+        title: isAr ? "تعديل الفكرة" : "Edit Concept",
+        defaultValue: concept.title || "",
+        okText: isAr ? "حفظ" : "Save",
+      }
+    );
+    if (newTitle == null || !newTitle.trim()) return;
+    const newPremise = await showPrompt(
+      isAr ? "تعديل ملخص وسرد الفكرة (Premise):" : "Edit Concept Premise / Story:",
+      {
+        title: isAr ? "تعديل ملخص الفكرة" : "Edit Concept Premise",
+        defaultValue: concept.premise || "",
+        okText: isAr ? "حفظ" : "Save",
+      }
+    );
+    const updatedConcept = {
+      ...concept,
+      title: newTitle.trim(),
+      premise: newPremise != null && newPremise.trim() ? newPremise.trim() : concept.premise,
+    };
+    updateNarrative((prev) => {
+      const nextConcepts = [...(prev.concepts || [])];
+      nextConcepts[idx] = updatedConcept;
+      const isCurSelected = prev.selectedConceptId === concept.id;
+      return {
+        ...prev,
+        concepts: nextConcepts,
+        userConcept:
+          concept.isUserOriginal || concept.id === "user-original-concept"
+            ? updatedConcept
+            : prev.userConcept,
+        selectedConcept: isCurSelected ? updatedConcept : prev.selectedConcept,
+      };
+    });
+  };
+
   const handleRegenerateConcepts = async () => {
-    setBusyMsg(isAr ? "جاري توليد 5 أفكار جديدة..." : "Generating 5 fresh concept proposals...");
+    setBusyMsg(isAr ? "جاري توليد 5 مقترحات بديلة جديدة..." : "Generating 5 fresh alternative proposals...");
     setStageError(null);
     try {
       const res = await regenerateConcepts(narrative.analysis, "", textProvider, codecraftCfg);
       if (Array.isArray(res.concepts) && res.concepts.length) {
-        updateNarrative((prev) => ({
-          ...prev,
-          concepts: res.concepts,
-          selectedConceptId: res.concepts[0].id,
-          selectedConcept: res.concepts[0],
-        }));
+        updateNarrative((prev) => {
+          const original =
+            prev.userConcept ||
+            prev.concepts?.find((c) => c.isUserOriginal || c.id === "user-original-concept") ||
+            null;
+          const fresh5 = res.concepts.slice(0, 5).map((c, i) => ({
+            ...c,
+            id: c.id || `alt-concept-${Date.now()}-${i + 1}`,
+            isUserOriginal: false,
+          }));
+          const combined = original ? [original, ...fresh5] : fresh5;
+          const stillHasSelected = combined.some((c) => c.id === prev.selectedConceptId);
+          const newSelected = stillHasSelected
+            ? combined.find((c) => c.id === prev.selectedConceptId)
+            : combined[0];
+          return {
+            ...prev,
+            concepts: combined,
+            userConcept: original || prev.userConcept,
+            selectedConceptId: newSelected?.id || combined[0]?.id || null,
+            selectedConcept: newSelected || combined[0] || null,
+          };
+        });
       }
     } catch (err) {
       setStageError(err.message || String(err));
@@ -582,14 +698,21 @@ export default function NarrativeWorkspace({
 
   // --- Stage 5: Upload Voice-Over Audio & Automatically Extract Authoritative Duration ---
   const effectiveAudioSec = useMemo(() => {
-    if (audioDuration > 0) return Math.round(audioDuration * 10) / 10;
+    // 1. Explicit manual duration override typed by user (e.g. 10:25) takes highest priority
     const manualSec = parseDurationInput(narrative.manualDurationInput);
-    if (manualSec > 0) return manualSec;
-    if (narrative.actualDurationSec > 0) return narrative.actualDurationSec;
-    return scriptEstSec || (narrative.config?.targetDurationMinutes || 12) * 60;
+    if (manualSec > 0) return Math.round(manualSec * 10) / 10;
+
+    // 2. Uploaded audio file physical duration takes next priority
+    if (audioDuration > 0) return Math.round(audioDuration * 10) / 10;
+
+    // 3. Persisted project actualDurationSec
+    if (narrative.actualDurationSec > 0) return Math.round(narrative.actualDurationSec * 10) / 10;
+
+    // 4. Fallback to script estimate or targetDurationMinutes
+    return scriptEstSec || (narrative.config?.targetDurationMinutes || 10) * 60;
   }, [
-    audioDuration,
     narrative.manualDurationInput,
+    audioDuration,
     narrative.actualDurationSec,
     scriptEstSec,
     narrative.config?.targetDurationMinutes,
@@ -646,54 +769,54 @@ export default function NarrativeWorkspace({
     if (!(effectiveAudioSec > 0)) {
       setStageError(
         isAr
-          ? "يرجى رفع ملف صوتي أو إدخال مدة الصوت الفعلية (مثال 12:55)."
-          : "Please upload narration audio, generate TTS, or enter the actual duration (e.g., 12:55)."
+          ? "يرجى رفع ملف صوتي أو إدخال مدة الصوت الفعلية (مثال 10:25)."
+          : "Please upload narration audio, generate TTS, or enter the actual duration (e.g., 10:25)."
       );
       return;
     }
 
-    const durationChanged =
-      narrative.actualDurationSec > 0 &&
-      Math.abs(narrative.actualDurationSec - effectiveAudioSec) > 1 &&
-      narrative.scenes?.length > 0;
-
     let updatedScenes = narrative.scenes || [];
-    if (durationChanged) {
-      const recalc = await showConfirm(
-        isAr
-          ? `تغيرت مدة الصوت الفعلية إلى ${formatDurationClock(
-              effectiveAudioSec
-            )}. هل تريد إعادة حساب توقيت جميع المشاهد تلقائياً؟`
-          : `Actual narration duration changed to ${formatDurationClock(
-              effectiveAudioSec
-            )}. Recalculate all scene timestamps to match?`,
-        { okText: isAr ? "إعادة حساب التوقيت" : "Recalculate Timings" }
-      );
-      if (recalc) {
-        updatedScenes = recalculateSceneTimings(updatedScenes, effectiveAudioSec);
-      }
+    const scenesEnd =
+      updatedScenes.length > 0 ? Number(updatedScenes[updatedScenes.length - 1]?.endTime || 0) : 0;
+    const durationMismatch =
+      updatedScenes.length > 0 && Math.abs(scenesEnd - effectiveAudioSec) > 0.5;
+
+    if (durationMismatch) {
+      // Automatically re-time all existing scenes to match the uploaded/specified audio duration exactly
+      updatedScenes = recalculateSceneTimings(updatedScenes, effectiveAudioSec);
     }
 
     // If no scenes exist yet, generate scene breakdown automatically
     if (!updatedScenes.length) {
       setBusyMsg(
         isAr
-          ? "جاري تقسيم السيناريو إلى مشاهد متسلسلة..."
-          : "Splitting approved script into timed visual scenes..."
+          ? `جاري تقسيم السيناريو إلى مشاهد متسلسلة تطابق مدة ${formatDurationClock(effectiveAudioSec)}...`
+          : `Splitting approved script into timed visual scenes matching ${formatDurationClock(effectiveAudioSec)}...`
       );
       setStageError(null);
       try {
+        const effectiveScriptText = (
+          narrative.approvedScript ||
+          narrative.scriptDraft ||
+          narrative.selectedConcept?.premise ||
+          narrative.selectedConcept?.title ||
+          narrative.reference?.topicName ||
+          narrative.reference?.title ||
+          ""
+        );
         const res = await generateSceneBreakdown({
-          script: narrative.approvedScript || narrative.scriptDraft,
+          script: effectiveScriptText,
           actualDurationSec: effectiveAudioSec,
-          concept: narrative.selectedConcept,
+          concept: narrative.selectedConcept || narrative.concepts?.[0],
+          topicName: narrative.reference?.topicName || narrative.reference?.title,
+          topicDescription: narrative.reference?.topicDescription || narrative.reference?.description,
           visualStylePreset: activeVisualPreset,
           channelProfile: activeChannel,
           targetSecondsPerScene: scenePaceSec,
           provider: textProvider,
           codecraftConfig: codecraftCfg,
         });
-        updatedScenes = res.scenes || [];
+        updatedScenes = Array.isArray(res?.scenes) && res.scenes.length > 0 ? res.scenes : [];
       } catch (err) {
         setStageError(err.message || String(err));
         setBusyMsg(null);
@@ -708,37 +831,67 @@ export default function NarrativeWorkspace({
       actualDurationSec: effectiveAudioSec,
       audioConfirmed: true,
       scenes: updatedScenes,
-      outdated: { ...prev.outdated, audio: false, scenes: false },
+      outdated: { ...prev.outdated, audio: false, scenes: false, imagePrompts: true },
       currentStage: 6,
       maxUnlockedStage: Math.max(prev.maxUnlockedStage || 5, 6),
     }));
   };
 
   // --- Stage 6: Scene Breakdown & Scene Tools ---
-  const handleRegenerateScenes = async () => {
+  const handleAutoSyncSceneTimings = () => {
+    if (!narrative.scenes?.length || !(effectiveAudioSec > 0)) return;
+    const retimed = recalculateSceneTimings(narrative.scenes, effectiveAudioSec);
+    updateNarrative((prev) => ({
+      ...prev,
+      actualDurationSec: effectiveAudioSec,
+      scenes: retimed,
+      outdated: { ...prev.outdated, scenes: false, imagePrompts: true, motionPrompts: true },
+    }));
+  };
+
+  const handleRegenerateScenes = async (paceOverride) => {
+    const pace = Number(paceOverride) || scenePaceSec || 10;
+    if (paceOverride) {
+      setScenePaceSec(pace);
+    }
+    const targetDuration = effectiveAudioSec || narrative.actualDurationSec || 600;
     setBusyMsg(
       isAr
-        ? `جاري تقسيم السيناريو إلى مشاهد متوازنة (مشهد كل ~${scenePaceSec} ثوانٍ)...`
-        : `Generating balanced scene breakdown (~1 scene every ${scenePaceSec}s)...`
+        ? `جاري تقسيم السيناريو إلى مشاهد متوازنة تطابق مدة ${formatDurationClock(targetDuration)} (مشهد كل ~${pace} ثوانٍ)...`
+        : `Generating scene breakdown strictly matching ${formatDurationClock(targetDuration)} (~1 scene every ${pace}s)...`
     );
     setStageError(null);
     try {
+      const effectiveScriptText = (
+        narrative.approvedScript ||
+        narrative.scriptDraft ||
+        narrative.selectedConcept?.premise ||
+        narrative.selectedConcept?.title ||
+        narrative.reference?.topicName ||
+        narrative.reference?.title ||
+        ""
+      );
       const res = await generateSceneBreakdown({
-        script: narrative.approvedScript || narrative.scriptDraft,
-        actualDurationSec: narrative.actualDurationSec || effectiveAudioSec,
-        concept: narrative.selectedConcept,
+        script: effectiveScriptText,
+        actualDurationSec: targetDuration,
+        concept: narrative.selectedConcept || narrative.concepts?.[0],
+        topicName: narrative.reference?.topicName || narrative.reference?.title,
+        topicDescription: narrative.reference?.topicDescription || narrative.reference?.description,
         visualStylePreset: activeVisualPreset,
         channelProfile: activeChannel,
-        targetSecondsPerScene: scenePaceSec,
+        targetSecondsPerScene: pace,
         provider: textProvider,
         codecraftConfig: codecraftCfg,
       });
-      updateNarrative((prev) => ({
-        ...prev,
-        scenes: res.scenes || [],
-        outdated: { ...prev.outdated, scenes: false, imagePrompts: true, motionPrompts: true },
-      }));
-      setSelectedSceneIdx(0);
+      if (Array.isArray(res?.scenes) && res.scenes.length > 0) {
+        updateNarrative((prev) => ({
+          ...prev,
+          actualDurationSec: targetDuration,
+          scenes: res.scenes,
+          outdated: { ...prev.outdated, scenes: false, imagePrompts: true, motionPrompts: true },
+        }));
+        setSelectedSceneIdx(0);
+      }
     } catch (err) {
       setStageError(err.message || String(err));
     } finally {
@@ -847,6 +1000,14 @@ export default function NarrativeWorkspace({
       setStageError(isAr ? "لا توجد مشاهد لاعتمادها." : "No scenes available to confirm.");
       return;
     }
+
+    let scenesToUse = narrative.scenes || [];
+    const scenesEnd =
+      scenesToUse.length > 0 ? Number(scenesToUse[scenesToUse.length - 1]?.endTime || 0) : 0;
+    if (scenesToUse.length > 0 && Math.abs(scenesEnd - effectiveAudioSec) > 0.5) {
+      scenesToUse = recalculateSceneTimings(scenesToUse, effectiveAudioSec);
+    }
+
     // If image prompts don't exist yet, generate them automatically from script + channel settings
     if (!narrative.imagePrompts?.length || narrative.outdated?.imagePrompts) {
       setBusyMsg(
@@ -857,7 +1018,7 @@ export default function NarrativeWorkspace({
       setStageError(null);
       try {
         const imgRes = await generateImagePromptsBatch({
-          scenes: narrative.scenes,
+          scenes: scenesToUse,
           script: narrative.approvedScript || narrative.scriptDraft || "",
           visualStyleLock: narrative.visualStyleLock,
           visualStylePreset: activeVisualPreset,
@@ -870,6 +1031,7 @@ export default function NarrativeWorkspace({
         });
         updateNarrative((prev) => ({
           ...prev,
+          scenes: scenesToUse,
           scenesConfirmed: true,
           imagePrompts: imgRes.prompts || [],
           imagePromptsConfirmed: true,
@@ -888,6 +1050,7 @@ export default function NarrativeWorkspace({
 
     updateNarrative((prev) => ({
       ...prev,
+      scenes: scenesToUse,
       scenesConfirmed: true,
       currentStage: 7,
       maxUnlockedStage: Math.max(prev.maxUnlockedStage || 6, 7),
@@ -896,6 +1059,13 @@ export default function NarrativeWorkspace({
 
   // --- Stage 7: Image Prompts Only (Generated from Script & Channel Settings) ---
   const handleRegenerateAllPrompts = async () => {
+    let scenesToUse = narrative.scenes || [];
+    const scenesEnd =
+      scenesToUse.length > 0 ? Number(scenesToUse[scenesToUse.length - 1]?.endTime || 0) : 0;
+    if (scenesToUse.length > 0 && Math.abs(scenesEnd - effectiveAudioSec) > 0.5) {
+      scenesToUse = recalculateSceneTimings(scenesToUse, effectiveAudioSec);
+    }
+
     setBusyMsg(
       isAr
         ? `جاري توليد برومبتات الصور حسب السكريبت وإعدادات قناة "${activeChannel?.name || ""}"...`
@@ -904,7 +1074,7 @@ export default function NarrativeWorkspace({
     setStageError(null);
     try {
       const imgRes = await generateImagePromptsBatch({
-        scenes: narrative.scenes,
+        scenes: scenesToUse,
         script: narrative.approvedScript || narrative.scriptDraft || "",
         visualStyleLock: narrative.visualStyleLock,
         visualStylePreset: activeVisualPreset,
@@ -917,6 +1087,7 @@ export default function NarrativeWorkspace({
       });
       updateNarrative((prev) => ({
         ...prev,
+        scenes: scenesToUse,
         imagePrompts: imgRes.prompts || [],
         outdated: { ...prev.outdated, imagePrompts: false },
       }));
@@ -1122,6 +1293,12 @@ export default function NarrativeWorkspace({
   const activeMotionPrompt =
     narrative.motionPrompts?.find((m) => m.sceneId === activeScene?.id) || null;
 
+  const scenesEnd =
+    (narrative.scenes || []).length > 0
+      ? Number(narrative.scenes[narrative.scenes.length - 1]?.endTime || 0)
+      : 0;
+  const isDurationSynced = Math.abs(scenesEnd - effectiveAudioSec) <= 0.5;
+
   return (
     <div className="uyns-shell" dir={isAr ? "rtl" : "ltr"}>
       {/* Left Sidebar */}
@@ -1236,17 +1413,28 @@ export default function NarrativeWorkspace({
               <span>{isAr ? "السيو (SEO)" : "SEO Package"}</span>
             </button>
 
-            {openSettingsFromWorkspace && (
-              <button
-                type="button"
-                onClick={openSettingsFromWorkspace}
-                className="uyns-top-pill text-emerald-400 border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20"
-                title={isAr ? "نظام تدوير المفاتيح المتعددة والتعافي التلقائي مفعل" : "Multi-API Key Rotation & Auto-Failover Active"}
-              >
-                <KeyRound className="w-3.5 h-3.5" />
-                <span>{isAr ? "تدوير المفاتيح ⚡" : "Key Rotation ⚡"}</span>
-              </button>
-            )}
+            {openSettingsFromWorkspace && (() => {
+              const keysCount = (getStoredGeminiKeys() || []).length || (globalSettings?.aiSettings?.geminiApiKeys || []).length || 1;
+              return (
+                <button
+                  type="button"
+                  onClick={openSettingsFromWorkspace}
+                  className="uyns-top-pill text-emerald-400 border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20"
+                  title={
+                    isAr
+                      ? `التدوير التلقائي بين المفاتيح مفعّل بدون أي تدخل منك (${keysCount} مفاتيح في الحوض)`
+                      : `Automatic Key Rotation Active (${keysCount} keys in pool)`
+                  }
+                >
+                  <KeyRound className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+                  <span>
+                    {isAr
+                      ? `تدوير المفاتيح تلقائياً (${keysCount} مفاتيح) ⚡`
+                      : `Auto-Rotation (${keysCount} keys) ⚡`}
+                  </span>
+                </button>
+              );
+            })()}
 
             {setTheme && (
               <button
@@ -1357,204 +1545,529 @@ export default function NarrativeWorkspace({
           ) : (
             <>
           {/* ================================================================
-              STAGE 1: NEW PROJECT — YOUTUBE REFERENCE ANALYSIS
+              STAGE 1: NEW PROJECT — REFERENCE & TOPIC CREATION
               ================================================================ */}
-          {stage === 1 && (
-            <div className="uyns-stage-card">
-              <h1 className="uyns-stage-title">
-                {isAr
-                  ? "إنشاء مشروع جديد — تحليل فيديو يوتيوب مرجعي"
-                  : "Create New Project — YouTube Reference Analysis"}
-              </h1>
+          {stage === 1 && (() => {
+            const refMode = narrative.reference?.mode || (narrative.reference?.youtubeUrl ? "youtube" : "topic");
+            const effectiveTopicTitle = narrative.reference?.topicName || narrative.reference?.title || "";
+            const effectiveTopicDesc = narrative.reference?.topicDescription !== undefined
+              ? narrative.reference.topicDescription
+              : (narrative.reference?.description || "");
 
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 mt-4">
-                <div className="lg:col-span-7 space-y-4">
-                  <div className="uyns-field">
-                    <label>{isAr ? "رابط فيديو يوتيوب (YouTube URL) *" : "YouTube URL *"}</label>
-                    <div className="flex gap-2">
-                      <input
-                        type="url"
-                        placeholder="https://www.youtube.com/watch?v=..."
-                        value={narrative.reference?.youtubeUrl || ""}
-                        onChange={(e) =>
-                          updateNarrative((p) => ({
-                            ...p,
-                            reference: { ...p.reference, youtubeUrl: e.target.value },
-                          }))
-                        }
-                      />
-                      <button
-                        type="button"
-                        className="uyns-btn uyns-btn--ghost uyns-btn--sm shrink-0"
-                        onClick={handlePreviewYoutubeUrl}
-                      >
-                        {isAr ? "معاينة الرابط" : "Fetch Preview"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="uyns-field">
-                    <label>{isAr ? "اسم المشروع *" : "Project Name *"}</label>
-                    <input
-                      type="text"
-                      placeholder="My Awesome Project"
-                      value={currentProject?.name || ""}
-                      onChange={(e) => onRenameProject(e.target.value, true)}
-                    />
-                  </div>
-
-                  {channels.length > 0 && (
-                    <div className="uyns-field">
-                      <label className="flex items-center justify-between">
-                        <span>{isAr ? "قناة المشروع (تطبيق جميع ستايلات القناة)" : "Channel Profile (Applies channel styles & avatar)"}</span>
-                        {openChannelsFromWorkspace && (
-                          <button
-                            type="button"
-                            onClick={openChannelsFromWorkspace}
-                            className="text-[11px] text-[var(--accent)] hover:underline"
-                          >
-                            {isAr ? "إدارة القنوات ←" : "Manage Channels →"}
-                          </button>
-                        )}
-                      </label>
-                      <select
-                        value={narrative.channelId || activeChannel?.id || ""}
-                        onChange={(e) => {
-                          const chId = e.target.value;
-                          const ch = channels.find((c) => c.id === chId);
-                          updateNarrative((p) => ({
-                            ...p,
-                            channelId: chId,
-                            config: {
-                              ...p.config,
-                              voiceId: ch?.voiceId || p.config?.voiceId || "onyx",
-                              aspectRatio: ch?.aspectRatio || p.config?.aspectRatio || "16:9",
-                            },
-                          }));
-                        }}
-                      >
-                        {channels.map((ch) => (
-                          <option key={ch.id} value={ch.id}>
-                            {ch.name} ({ch.niche})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  )}
-
-                  <div className="uyns-field">
-                    <label>{isAr ? "رفع صورة مصغرة مخصصة (اختياري)" : "Upload Custom Thumbnail (Optional)"}</label>
-                    <Dropzone
-                      accept="image/*"
-                      onFiles={handleThumbUpload}
-                      icon="🖼️"
-                      title={isAr ? "اضغط للرفع أو اسحب الصورة المصغرة هنا" : "Click to upload or drag & drop"}
-                      hint="PNG, JPG, WEBP (Analyzed with Gemini Vision)"
-                      filled={!!narrative.reference?.thumbnailBase64}
-                      filledLabel={isAr ? "تم إرفاق الصورة المصغرة" : "Thumbnail attached for Vision AI"}
-                    />
-                  </div>
-
-                  <div className="uyns-field">
-                    <label>
+            return (
+              <div className="uyns-stage-card">
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[var(--line-soft)]">
+                  <div>
+                    <h1 className="uyns-stage-title !mb-1">
                       {isAr
-                        ? "نص التفريغ الصوتي أو ملاحظات الفيديو المرجعي (اختياري)"
-                        : "Reference Transcript or Notes (Optional — for spoken pacing analysis)"}
-                    </label>
-                    <textarea
-                      rows={3}
-                      placeholder={
-                        isAr
-                          ? "الصق نص تفريغ الفيديو المرجعي أو ملاحظات إضافية هنا لتحليل أسلوب السرد والإيقاع بدقة..."
-                          : "Paste the reference video's transcript or your notes here for deeper spoken-content and pacing analysis..."
-                      }
-                      value={narrative.reference?.pastedTranscript || ""}
-                      onChange={(e) =>
-                        updateNarrative((p) => ({
-                          ...p,
-                          reference: { ...p.reference, pastedTranscript: e.target.value },
-                        }))
-                      }
-                    />
+                        ? refMode === "topic"
+                          ? "إنشاء مشروع جديد — فكرة موضوع مخصص"
+                          : "إنشاء مشروع جديد — تحليل فيديو يوتيوب مرجعي"
+                        : refMode === "topic"
+                        ? "Create New Project — Direct Topic & Brief"
+                        : "Create New Project — YouTube Reference Analysis"}
+                    </h1>
+                    <p className="text-xs text-[var(--muted)]">
+                      {isAr
+                        ? "اختر طريقة بدء مشروعك: تحليل فيديو يوتيوب موجود أو كتابة اسم موضوع ووصف مباشر"
+                        : "Choose how to start: analyze a proven YouTube video, or define your topic & brief directly"}
+                    </p>
                   </div>
                 </div>
 
-                {/* Right Column: Quick Analysis Preview Card */}
-                <div className="lg:col-span-5">
-                  <div className="uyns-preview-card">
-                    <div className="uyns-preview-card__thumb">
-                      {narrative.reference?.thumbnailUrl ? (
-                        <img
-                          src={narrative.reference.thumbnailUrl}
-                          alt="YouTube Reference Thumbnail"
-                          referrerPolicy="no-referrer"
-                        />
-                      ) : (
-                        <div className="uyns-preview-card__empty">
-                          <Play className="w-10 h-10 text-[var(--bad)]" />
-                          <span className="text-xs text-[var(--muted)] mt-2">
-                            {isAr ? "معاينة الصورة المصغرة للفيديو المرجعي" : "YouTube Reference Thumbnail Preview"}
+                {/* Option 1 vs Option 2 Mode Selector */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4 mb-5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateNarrative((p) => ({
+                        ...p,
+                        reference: { ...p.reference, mode: "youtube" },
+                      }))
+                    }
+                    className={`p-3.5 rounded-xl border text-right transition-all flex items-start gap-3 cursor-pointer ${
+                      refMode === "youtube"
+                        ? "bg-[var(--panel-2)] border-[var(--accent)] shadow-sm text-[var(--text)] ring-1 ring-[var(--accent)]/30"
+                        : "bg-[var(--panel-1)] border-[var(--line-soft)] text-[var(--muted)] hover:border-[var(--line)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    <div
+                      className={`p-2.5 rounded-lg shrink-0 ${
+                        refMode === "youtube"
+                          ? "bg-red-500/15 text-red-500"
+                          : "bg-[var(--panel-2)] text-[var(--muted)]"
+                      }`}
+                    >
+                      <Play className="w-5 h-5 fill-current" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-bold text-[var(--text)] flex items-center justify-between">
+                        <span>{isAr ? "الخيار 1: فيديو يوتيوب مرجعي" : "Option 1: YouTube Reference URL"}</span>
+                        {refMode === "youtube" && (
+                          <span className="text-[10px] font-bold text-[var(--accent)] bg-[var(--accent)]/15 px-2 py-0.5 rounded-full">
+                            {isAr ? "محدد ✓" : "Active ✓"}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-[var(--muted)] mt-1 leading-relaxed">
+                        {isAr
+                          ? "تحليل فيديو يوتيوب ناجح واستلهام بنيته السردية، وزوايا الإثارة وصورته المصغرة"
+                          : "Analyze a viral YouTube video's hooks, narrative pacing, and visual style"}
+                      </p>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateNarrative((p) => ({
+                        ...p,
+                        reference: { ...p.reference, mode: "topic", youtubeUrl: "" },
+                      }))
+                    }
+                    className={`p-3.5 rounded-xl border text-right transition-all flex items-start gap-3 cursor-pointer ${
+                      refMode === "topic"
+                        ? "bg-[var(--panel-2)] border-amber-400 shadow-sm text-[var(--text)] ring-1 ring-amber-400/30"
+                        : "bg-[var(--panel-1)] border-[var(--line-soft)] text-[var(--muted)] hover:border-[var(--line)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    <div
+                      className={`p-2.5 rounded-lg shrink-0 ${
+                        refMode === "topic"
+                          ? "bg-amber-400/20 text-amber-400"
+                          : "bg-[var(--panel-2)] text-[var(--muted)]"
+                      }`}
+                    >
+                      <Lightbulb className="w-5 h-5" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-bold text-[var(--text)] flex items-center justify-between">
+                        <span>{isAr ? "الخيار 2: اسم الموضوع + وصف مختصر" : "Option 2: Topic Name & Brief"}</span>
+                        {refMode === "topic" && (
+                          <span className="text-[10px] font-bold text-amber-400 bg-amber-400/15 px-2 py-0.5 rounded-full">
+                            {isAr ? "محدد ✓" : "Active ✓"}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-[var(--muted)] mt-1 leading-relaxed">
+                        {isAr
+                          ? "أدخل اسم الموضوع مع وصف مختصر (ليس إجباري) وسيتولى الذكاء الاصطناعي بناء الفكرة والستايل"
+                          : "Enter topic name with an optional brief description and let AI develop the concept & visual style"}
+                      </p>
+                    </div>
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 mt-4">
+                  <div className="lg:col-span-7 space-y-4">
+                    {/* OPTION 1: YouTube Reference URL Inputs */}
+                    {refMode === "youtube" ? (
+                      <div className="uyns-field">
+                        <label>{isAr ? "رابط فيديو يوتيوب (YouTube URL) *" : "YouTube URL *"}</label>
+                        <div className="flex gap-2">
+                          <input
+                            type="url"
+                            placeholder="https://www.youtube.com/watch?v=..."
+                            value={narrative.reference?.youtubeUrl || ""}
+                            onChange={(e) =>
+                              updateNarrative((p) => ({
+                                ...p,
+                                reference: { ...p.reference, youtubeUrl: e.target.value },
+                              }))
+                            }
+                          />
+                          <button
+                            type="button"
+                            className="uyns-btn uyns-btn--ghost uyns-btn--sm shrink-0"
+                            onClick={handlePreviewYoutubeUrl}
+                          >
+                            {isAr ? "معاينة الرابط" : "Fetch Preview"}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      /* OPTION 2: Topic Name & Optional Brief Description */
+                      <>
+                        <div className="uyns-field">
+                          <label className="flex items-center justify-between">
+                            <span className="font-bold text-[var(--text)]">
+                              {isAr ? "اسم الموضوع أو فكرة الفيديو *" : "Topic Name / Subject Title *"}
+                            </span>
+                            <span className="text-[11px] font-semibold text-amber-400 bg-amber-400/10 px-2 py-0.5 rounded">
+                              {isAr ? "إجباري" : "Required"}
+                            </span>
+                          </label>
+                          <input
+                            type="text"
+                            className="font-medium"
+                            placeholder={
+                              isAr
+                                ? "مثال: أسرار الحضارة السومرية واختراع الكتابة، أو كيف يعمل الدماغ أثناء النوم؟ أو لغز مثلث برمودا..."
+                                : "e.g. Secrets of the Sumerian Civilization, How the Brain Works in Sleep, The Bermuda Mystery..."
+                            }
+                            value={effectiveTopicTitle}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              updateNarrative((p) => ({
+                                ...p,
+                                reference: { ...p.reference, topicName: val, title: val, mode: "topic", youtubeUrl: "" },
+                              }));
+                              if (
+                                !currentProject?.name ||
+                                currentProject.name === "My Awesome Project" ||
+                                currentProject.name === "مشروع جديد"
+                              ) {
+                                onRenameProject(val, true);
+                              }
+                            }}
+                          />
+                          <span className="text-[11px] text-[var(--muted)]">
+                            {isAr
+                              ? "اكتب عنوان الموضوع أو الفكرة العامة التي تريد إنتاج وثائقي أو فيديو سردي حولها."
+                              : "Enter the main subject or story topic for your narrative video."}
                           </span>
                         </div>
-                      )}
+
+                        <div className="uyns-field">
+                          <label className="flex items-center justify-between">
+                            <span className="font-semibold text-[var(--text)]">
+                              {isAr ? "وصف مختصر للفكرة (اختياري — ليس إجباري)" : "Brief Description / Creative Angle (Optional — Not Mandatory)"}
+                            </span>
+                            <span className="text-[11px] text-[var(--muted)] bg-[var(--panel-2)] px-2 py-0.5 rounded">
+                              {isAr ? "اختياري (ليس إجباري)" : "Optional"}
+                            </span>
+                          </label>
+                          <textarea
+                            rows={3}
+                            placeholder={
+                              isAr
+                                ? "اختياري: اكتب هنا أي تفاصيل، زاوية الطرح المفضلة، الجمهور المستهدف، أو نقاط تود التركيز عليها... يمكنك ترك هذا الحقل فارغاً تماماً وسيقوم الذكاء الاصطناعي ببناء وتطوير الفكرة والقصة بالكامل."
+                                : "Optional: Add any specific angles, key points, or target audience... You can leave this completely blank and AI will develop the entire story arc."
+                            }
+                            value={effectiveTopicDesc}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              updateNarrative((p) => ({
+                                ...p,
+                                reference: { ...p.reference, topicDescription: val, description: val },
+                              }));
+                            }}
+                          />
+                        </div>
+
+                        {/* Quick Creative Angle Suggestion Chips */}
+                        <div className="p-3 rounded-xl bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-[var(--text)] flex items-center gap-1.5">
+                              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                              {isAr ? "اقتراحات زوايا سريعة (اضغط للإضافة):" : "Suggested Creative Angles (Click to add):"}
+                            </span>
+                            <span className="text-[10px] text-[var(--muted)]">
+                              {isAr ? "تساعد في توجيه السيناريو" : "Guides storytelling angle"}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {[
+                              { ar: "أسرار غامضة وغير مروية", en: "Mysterious untold secrets" },
+                              { ar: "كيف بدأت القصة والحقيقة الصادمة", en: "How it all began & shocking truth" },
+                              { ar: "نقطة التحول التي غيرت مجرى الأحداث", en: "The pivotal turning point" },
+                              { ar: "أخطاء كارثية مجهولة لم يلاحظها أحد", en: "Catastrophic unknown blunders" },
+                              { ar: "الأثر الخفي الممتد حتى يومنا هذا", en: "The hidden legacy in modern life" },
+                              { ar: "الصراع النفسي والدراما الإنسانية", en: "Psychological conflict & human drama" },
+                            ].map((angle, aIdx) => (
+                              <button
+                                key={aIdx}
+                                type="button"
+                                onClick={() => {
+                                  const textToAdd = isAr ? angle.ar : angle.en;
+                                  const current = (effectiveTopicDesc || "").trim();
+                                  const nextVal = current ? `${current} - التركيز على: ${textToAdd}` : `التركيز على: ${textToAdd}`;
+                                  updateNarrative((p) => ({
+                                    ...p,
+                                    reference: { ...p.reference, topicDescription: nextVal, description: nextVal },
+                                  }));
+                                }}
+                                className="text-[11px] px-2.5 py-1 rounded-lg bg-[var(--panel-1)] hover:bg-amber-400/15 hover:text-amber-300 border border-[var(--line-soft)] text-[var(--muted)] transition-all cursor-pointer"
+                              >
+                                + {isAr ? angle.ar : angle.en}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Direct Prominent Action Button for Option 2 */}
+                        <div className="pt-2">
+                          <button
+                            type="button"
+                            disabled={!!busyMsg || !effectiveTopicTitle.trim()}
+                            onClick={handleAnalyzeAndContinue}
+                            className="uyns-btn uyns-btn--primary w-full justify-center py-3 text-sm font-bold shadow-lg cursor-pointer bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black border-none"
+                          >
+                            <Sparkles className="w-4 h-4 text-black animate-spin-slow" />
+                            <span>
+                              {busyMsg
+                                ? (isAr ? "جاري تحليل الموضوع وتوليد 5 أفكار وسيناريوهات مقترحة..." : "Analyzing topic & generating 5 concepts...")
+                                : (isAr ? "✨ توليد 5 أفكار وسيناريوهات مقترحة للموضوع ←" : "✨ Generate 5 Suggested Concepts for Topic →")}
+                            </span>
+                          </button>
+                          {!effectiveTopicTitle.trim() && (
+                            <p className="text-[11px] text-center text-[var(--muted)] mt-1.5">
+                              {isAr ? "يرجى كتابة اسم الموضوع أو الفكرة أولاً لتفعيل زر توليد الأفكار" : "Please enter the topic title first to enable concept generation"}
+                            </p>
+                          )}
+                        </div>
+                      </>
+                    )}
+
+                    {/* Shared: Project Name */}
+                    <div className="uyns-field">
+                      <label>{isAr ? "اسم المشروع *" : "Project Name *"}</label>
+                      <input
+                        type="text"
+                        placeholder="My Awesome Project"
+                        value={currentProject?.name || ""}
+                        onChange={(e) => onRenameProject(e.target.value, true)}
+                      />
                     </div>
 
-                    <div className="space-y-2 mt-4">
-                      <h3 className="text-sm font-bold">
-                        {isAr ? "معاينة سريعة للمرجع" : "Quick Analysis Preview"}
-                      </h3>
-                      <div className="text-xs space-y-1 text-[var(--muted)]">
-                        <div>
-                          <strong className="text-[var(--text)]">Title:</strong>{" "}
-                          {narrative.reference?.title || "Awaiting URL / input"}
-                        </div>
-                        <div>
-                          <strong className="text-[var(--text)]">Channel:</strong>{" "}
-                          {narrative.reference?.author || "—"}
-                        </div>
-                        {narrative.reference?.duration && (
-                          <div>
-                            <strong className="text-[var(--text)]">Duration:</strong>{" "}
-                            {narrative.reference.duration}
+                    {/* Shared: Channel Profile Selection */}
+                    {channels.length > 0 && (
+                      <div className="uyns-field">
+                        <label className="flex items-center justify-between">
+                          <span>{isAr ? "قناة المشروع (تطبيق جميع ستايلات القناة)" : "Channel Profile (Applies channel styles & avatar)"}</span>
+                          {openChannelsFromWorkspace && (
+                            <button
+                              type="button"
+                              onClick={openChannelsFromWorkspace}
+                              className="text-[11px] text-[var(--accent)] hover:underline"
+                            >
+                              {isAr ? "إدارة القنوات ←" : "Manage Channels →"}
+                            </button>
+                          )}
+                        </label>
+                        <select
+                          value={narrative.channelId || activeChannel?.id || ""}
+                          onChange={(e) => {
+                            const chId = e.target.value;
+                            const ch = channels.find((c) => c.id === chId);
+                            updateNarrative((p) => ({
+                              ...p,
+                              channelId: chId,
+                              config: {
+                                ...p.config,
+                                voiceId: ch?.voiceId || p.config?.voiceId || "Charon",
+                                aspectRatio: ch?.aspectRatio || p.config?.aspectRatio || "16:9",
+                              },
+                            }));
+                          }}
+                        >
+                          {channels.map((ch) => (
+                            <option key={ch.id} value={ch.id}>
+                              {ch.name} ({ch.niche})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {/* Shared: Upload Custom Thumbnail / Visual Style Reference */}
+                    <div className="uyns-field">
+                      <label>
+                        {isAr
+                          ? refMode === "topic"
+                            ? "رفع صورة مصغرة أو ستايل بصري مرجعي (اختياري)"
+                            : "رفع صورة مصغرة مخصصة (اختياري)"
+                          : refMode === "topic"
+                          ? "Upload Style Reference / Thumbnail (Optional)"
+                          : "Upload Custom Thumbnail (Optional)"}
+                      </label>
+                      <Dropzone
+                        accept="image/*"
+                        onFiles={handleThumbUpload}
+                        icon="🖼️"
+                        title={isAr ? "اضغط للرفع أو اسحب الصورة المصغرة هنا" : "Click to upload or drag & drop"}
+                        hint="PNG, JPG, WEBP (Analyzed with Gemini Vision)"
+                        filled={!!narrative.reference?.thumbnailBase64}
+                        filledLabel={isAr ? "تم إرفاق الصورة المصغرة" : "Thumbnail attached for Vision AI"}
+                      />
+                    </div>
+
+                    {/* Shared: Notes / Transcript */}
+                    <div className="uyns-field">
+                      <label>
+                        {isAr
+                          ? refMode === "topic"
+                            ? "ملاحظات أو مراجع إضافية للموضوع (اختياري)"
+                            : "نص التفريغ الصوتي أو ملاحظات الفيديو المرجعي (اختياري)"
+                          : refMode === "topic"
+                          ? "Additional Topic Notes / Outline (Optional)"
+                          : "Reference Transcript or Notes (Optional — for spoken pacing analysis)"}
+                      </label>
+                      <textarea
+                        rows={3}
+                        placeholder={
+                          isAr
+                            ? refMode === "topic"
+                              ? "اختياري: أضف أي مقالات، روابط، أو نقاط بحثية إضافية لإثراء المعالجة السردية..."
+                              : "الصق نص تفريغ الفيديو المرجعي أو ملاحظات إضافية هنا لتحليل أسلوب السرد والإيقاع بدقة..."
+                            : refMode === "topic"
+                            ? "Optional: Add any research links, quotes, or outline points to enrich the narrative..."
+                            : "Paste the reference video's transcript or your notes here for deeper spoken-content and pacing analysis..."
+                        }
+                        value={narrative.reference?.pastedTranscript || ""}
+                        onChange={(e) =>
+                          updateNarrative((p) => ({
+                            ...p,
+                            reference: { ...p.reference, pastedTranscript: e.target.value },
+                          }))
+                        }
+                      />
+                    </div>
+                  </div>
+
+                  {/* Right Column: Quick Analysis Preview Card */}
+                  <div className="lg:col-span-5">
+                    <div className="uyns-preview-card">
+                      <div className="uyns-preview-card__thumb">
+                        {narrative.reference?.thumbnailUrl ? (
+                          <img
+                            src={narrative.reference.thumbnailUrl}
+                            alt="Reference Thumbnail"
+                            referrerPolicy="no-referrer"
+                          />
+                        ) : refMode === "topic" ? (
+                          <div className="uyns-preview-card__empty bg-gradient-to-br from-amber-500/10 via-[var(--panel-2)] to-[var(--panel-1)] flex-col">
+                            <Lightbulb className="w-12 h-12 text-amber-400 animate-pulse" />
+                            <span className="text-xs font-bold text-[var(--text)] mt-3">
+                              {isAr ? "فكرة موضوع مباشر" : "Direct Topic Mode"}
+                            </span>
+                            <span className="text-[11px] text-[var(--muted)] text-center px-4 mt-1">
+                              {isAr
+                                ? "سيتم اشتقاق الستايل البصري وتوليد 5 أفكار سينمائية متكاملة بالذكاء الاصطناعي"
+                                : "AI will craft a visual style lock and generate 5 distinct concepts"}
+                            </span>
                           </div>
-                        )}
-                        {activeChannel && (
-                          <div>
-                            <strong className="text-[var(--text)]">Active Style Kit:</strong>{" "}
-                            <span className="text-[var(--accent)]">{activeChannel.name}</span>
+                        ) : (
+                          <div className="uyns-preview-card__empty">
+                            <Play className="w-10 h-10 text-[var(--bad)]" />
+                            <span className="text-xs text-[var(--muted)] mt-2">
+                              {isAr ? "معاينة الصورة المصغرة للفيديو المرجعي" : "YouTube Reference Thumbnail Preview"}
+                            </span>
                           </div>
                         )}
                       </div>
 
-                      {narrative.reference?.notice && (
-                        <p className="text-[11px] text-[var(--muted)] bg-[var(--panel-2)] p-2.5 rounded-lg border border-[var(--line-soft)]">
-                          {narrative.reference.notice}
-                        </p>
-                      )}
+                      <div className="space-y-3 mt-4">
+                        <div className="flex items-center justify-between">
+                          <h3 className="text-sm font-bold flex items-center gap-1.5">
+                            {refMode === "topic" ? (
+                              <Lightbulb className="w-4 h-4 text-amber-400" />
+                            ) : (
+                              <Play className="w-4 h-4 text-red-500" />
+                            )}
+                            <span>
+                              {isAr
+                                ? refMode === "topic"
+                                  ? "معاينة فكرة الموضوع"
+                                  : "معاينة سريعة للمرجع"
+                                : refMode === "topic"
+                                ? "Topic Concept Preview"
+                                : "Quick Analysis Preview"}
+                            </span>
+                          </h3>
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                            refMode === "topic"
+                              ? "bg-amber-400/15 text-amber-400"
+                              : "bg-red-500/15 text-red-500"
+                          }`}>
+                            {refMode === "topic"
+                              ? (isAr ? "موضوع مباشر" : "Topic Mode")
+                              : (isAr ? "فيديو يوتيوب" : "YouTube")}
+                          </span>
+                        </div>
 
-                      <button
-                        type="button"
-                        disabled={!!busyMsg}
-                        onClick={handleAnalyzeAndContinue}
-                        className="uyns-btn uyns-btn--primary w-full justify-center mt-4 py-3"
-                      >
-                        <Sparkles className="w-4 h-4" />
-                        <span>
-                          {busyMsg
-                            ? isAr
-                              ? "جاري التحليل..."
-                              : "Analyzing..."
-                            : isAr
-                            ? "تحليل ومتابعة ←"
-                            : "Analyze & Continue →"}
-                        </span>
-                      </button>
+                        <div className="text-xs space-y-2 text-[var(--muted)] bg-[var(--panel-2)] p-3 rounded-xl border border-[var(--line-soft)]">
+                          <div>
+                            <strong className="text-[var(--text)]">
+                              {isAr ? (refMode === "topic" ? "الموضوع:" : "العنوان:") : (refMode === "topic" ? "Topic:" : "Title:")}
+                            </strong>{" "}
+                            <span className="text-[var(--accent)] font-semibold break-words">
+                              {refMode === "topic"
+                                ? effectiveTopicTitle || (isAr ? "في انتظار إدخال اسم الموضوع..." : "Awaiting topic title...")
+                                : narrative.reference?.title || (isAr ? "في انتظار الرابط / الإدخال" : "Awaiting URL / input")}
+                            </span>
+                          </div>
+
+                          {refMode === "topic" ? (
+                            <div>
+                              <strong className="text-[var(--text)]">
+                                {isAr ? "الوصف:" : "Brief:"}
+                              </strong>{" "}
+                              <span className="italic break-words">
+                                {effectiveTopicDesc ||
+                                  (isAr
+                                    ? "(اختياري — بناء إبداعي كامل بواسطة الذكاء الاصطناعي)"
+                                    : "(Optional — creative freedom by AI)")}
+                              </span>
+                            </div>
+                          ) : (
+                            <div>
+                              <strong className="text-[var(--text)]">Channel:</strong>{" "}
+                              {narrative.reference?.author || "—"}
+                            </div>
+                          )}
+
+                          {refMode === "youtube" && narrative.reference?.duration && (
+                            <div>
+                              <strong className="text-[var(--text)]">Duration:</strong>{" "}
+                              {narrative.reference.duration}
+                            </div>
+                          )}
+
+                          {activeChannel && (
+                            <div>
+                              <strong className="text-[var(--text)]">
+                                {isAr ? "النيش والستايل النشط:" : "Active Style Kit:"}
+                              </strong>{" "}
+                              <span className="text-emerald-400 font-semibold">{activeChannel.name} ({activeChannel.niche})</span>
+                            </div>
+                          )}
+                        </div>
+
+                        {narrative.reference?.notice && (
+                          <p className="text-[11px] text-[var(--muted)] bg-[var(--panel-2)] p-2.5 rounded-lg border border-[var(--line-soft)]">
+                            {narrative.reference.notice}
+                          </p>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={!!busyMsg}
+                          onClick={handleAnalyzeAndContinue}
+                          className="uyns-btn uyns-btn--primary w-full justify-center mt-4 py-3 cursor-pointer shadow-md"
+                        >
+                          <Sparkles className="w-4 h-4 text-amber-300" />
+                          <span>
+                            {busyMsg
+                              ? isAr
+                                ? "جاري التحليل وتوليد 5 أفكار..."
+                                : "Analyzing & Generating Concepts..."
+                              : isAr
+                              ? refMode === "topic"
+                                ? "تحليل الموضوع وتوليد 5 أفكار ←"
+                                : "تحليل ومتابعة ←"
+                              : refMode === "topic"
+                              ? "Analyze Topic & Generate 5 Concepts →"
+                              : "Analyze & Continue →"}
+                          </span>
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* ================================================================
               STAGE 2: REFERENCE ANALYSIS RESULTS & 5 ORIGINAL CONCEPTS
@@ -1566,12 +2079,12 @@ export default function NarrativeWorkspace({
                   <CheckCircle2 className="w-7 h-7 text-[var(--accent)]" />
                   <div>
                     <h1 className="text-lg font-extrabold">
-                      {isAr ? "اكتمل التحليل بنجاح" : "Analysis Complete"}
+                      {isAr ? "اكتمل التحليل وتجهيز الأفكار" : "Concepts & Analysis Complete"}
                     </h1>
                     <p className="text-xs text-[var(--muted)]">
                       {isAr
-                        ? "قمنا بتحليل المرجع وتوليد 5 أفكار أصلية مخصصة لمشروعك."
-                        : "We've analyzed the reference and generated 5 original concepts for you."}
+                        ? "قمنا بتجهيز معلومات فكرتك الأصلية وتوليد 5 مقترحات إبداعية بديلة مخصصة لمشروعك."
+                        : "We've fully prepared your original idea plus generated 5 alternative creative proposals."}
                     </p>
                   </div>
                 </div>
@@ -1579,29 +2092,346 @@ export default function NarrativeWorkspace({
                 <div className="uyns-segmented">
                   <button
                     type="button"
-                    onClick={() => setConceptTab("analysis")}
-                    className={`uyns-segmented__btn ${conceptTab === "analysis" ? "is-active" : ""}`}
-                  >
-                    {isAr ? "تحليل المرجع" : "Reference Analysis"}
-                  </button>
-                  <button
-                    type="button"
                     onClick={() => setConceptTab("concepts")}
                     className={`uyns-segmented__btn ${conceptTab === "concepts" ? "is-active" : ""}`}
                   >
-                    {isAr ? "5 أفكار مقترحة" : "5 Concepts"}
+                    <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                    <span>{isAr ? "فكرتك + 5 مقترحات" : "Your Idea + 5 Proposals"}</span>
+                    {(narrative.concepts?.length || 0) > 0 && (
+                      <span className="text-[10px] bg-amber-400/20 text-amber-300 px-1.5 py-0.2 rounded-full">
+                        {narrative.concepts.length}
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConceptTab("analysis")}
+                    className={`uyns-segmented__btn ${conceptTab === "analysis" ? "is-active" : ""}`}
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    <span>
+                      {isAr
+                        ? narrative.reference?.mode === "topic"
+                          ? "استراتيجية الموضوع"
+                          : "تحليل المرجع"
+                        : narrative.reference?.mode === "topic"
+                        ? "Topic Strategy"
+                        : "Reference Analysis"}
+                    </span>
                   </button>
                   <button
                     type="button"
                     onClick={() => setConceptTab("styleLock")}
                     className={`uyns-segmented__btn ${conceptTab === "styleLock" ? "is-active" : ""}`}
                   >
-                    {isAr ? "قفل النمط البصري" : "Visual Style Lock"}
+                    <Film className="w-3.5 h-3.5" />
+                    <span>{isAr ? "قفل النمط البصري" : "Visual Style Lock"}</span>
                   </button>
                 </div>
               </div>
 
-              {conceptTab === "styleLock" ? (
+              {/* TAB 1: USER'S ORIGINAL IDEA (PREPARED) + 5 ALTERNATIVE PROPOSALS */}
+              {conceptTab === "concepts" && (
+                <div className="mt-5 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl bg-gradient-to-r from-emerald-500/10 via-[var(--panel-2)] to-amber-500/10 border border-emerald-500/25">
+                    <div>
+                      <h2 className="text-base font-bold text-[var(--text)] flex items-center gap-2">
+                        <Sparkles className="w-5 h-5 text-emerald-400" />
+                        <span>
+                          {isAr
+                            ? "فكرتك الأصلية المجهزة + 5 مقترحات إبداعية بديلة"
+                            : "Your Prepared Original Idea + 5 Creative Proposals"}
+                        </span>
+                      </h2>
+                      <p className="text-xs text-[var(--muted)] mt-1">
+                        {isAr
+                          ? "اختر فكرتك الأصلية (معلومات مجهزة بالكامل ومطابقة لطلبك) أو اختر أحد المقترحات الـ 5 البديلة للمتابعة."
+                          : "Choose your original idea (with all narrative fields prepared) or any of the 5 alternative proposals to proceed."}
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={!!busyMsg}
+                      onClick={handleRegenerateConcepts}
+                      className="uyns-btn uyns-btn--ghost uyns-btn--sm shrink-0 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${busyMsg ? "animate-spin" : ""}`} />
+                      <span>{isAr ? "توليد 5 مقترحات بديلة أخرى" : "Regenerate 5 Alternatives"}</span>
+                    </button>
+                  </div>
+
+                  {(!narrative.concepts || narrative.concepts.length === 0) ? (
+                    <div className="p-8 rounded-xl border border-dashed border-[var(--line)] bg-[var(--panel-1)] text-center space-y-3">
+                      <Sparkles className="w-10 h-10 text-amber-400 mx-auto animate-pulse" />
+                      <h3 className="text-sm font-bold text-[var(--text)]">
+                        {isAr ? "لم تظهر أفكار مقترحة بعد؟" : "No concepts generated yet"}
+                      </h3>
+                      <p className="text-xs text-[var(--muted)] max-w-md mx-auto">
+                        {isAr
+                          ? "اضغط الزر أدناه وسيقوم الذكاء الاصطناعي بتجهيز فكرتك الأصلية وتوليد 5 مقترحات فوراً."
+                          : "Click the button below to prepare your concept and generate 5 proposals."}
+                      </p>
+                      <button
+                        type="button"
+                        disabled={!!busyMsg}
+                        onClick={handleRegenerateConcepts}
+                        className="uyns-btn uyns-btn--primary mx-auto"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                        <span>{isAr ? "تجهيز وتوليد الأفكار الآن ←" : "Prepare Concepts Now →"}</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-3.5">
+                      {narrative.concepts.map((c, idx) => {
+                        const isSelected = narrative.selectedConceptId === c.id;
+                        const isOriginal = Boolean(c.isUserOriginal || c.id === "user-original-concept");
+                        const displayNum = isOriginal ? "🌟" : (narrative.concepts[0]?.isUserOriginal ? idx : idx + 1);
+                        return (
+                          <div
+                            key={c.id || idx}
+                            onClick={() => handleSelectConcept(c)}
+                            className={`p-4 rounded-xl border transition-all cursor-pointer relative ${
+                              isOriginal
+                                ? isSelected
+                                  ? "bg-gradient-to-r from-emerald-950/40 via-[var(--panel-2)] to-[var(--panel-2)] border-emerald-400 shadow-[0_4px_25px_rgba(16,185,129,0.18)] ring-1 ring-emerald-400/50"
+                                  : "bg-gradient-to-r from-emerald-950/20 via-[var(--panel-1)] to-[var(--panel-1)] border-emerald-500/35 hover:border-emerald-500/60 hover:bg-[var(--panel-2)]"
+                                : isSelected
+                                ? "bg-[var(--panel-2)] border-amber-400 shadow-md ring-1 ring-amber-400/40"
+                                : "bg-[var(--panel-1)] border-[var(--line-soft)] hover:border-[var(--line)] hover:bg-[var(--panel-2)]"
+                            }`}
+                          >
+                            <div className="flex items-start gap-3.5">
+                              <div
+                                className={`w-9 h-9 rounded-xl flex items-center justify-center font-bold text-sm shrink-0 ${
+                                  isOriginal
+                                    ? isSelected
+                                      ? "bg-emerald-400 text-black shadow-sm text-base"
+                                      : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-base"
+                                    : isSelected
+                                    ? "bg-amber-400 text-black shadow-sm"
+                                    : "bg-[var(--panel-2)] text-[var(--muted)] border border-[var(--line-soft)]"
+                                }`}
+                              >
+                                {displayNum}
+                              </div>
+
+                              <div className="flex-1 min-w-0">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <h3 className="text-sm font-bold text-[var(--text)]">
+                                      {c.title}
+                                    </h3>
+                                    {isOriginal && (
+                                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1 shadow-sm">
+                                        <span>🌟</span>
+                                        <span>{isAr ? "فكرتك الأصلية (معلومات مجهزة بالكامل)" : "Your Original Idea (Fully Prepared)"}</span>
+                                      </span>
+                                    )}
+                                    {!isOriginal && (
+                                      <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-[var(--panel-2)] text-amber-300/80 border border-amber-500/20">
+                                        {isAr ? `💡 مقترح بديل #${displayNum}` : `💡 Alternative #${displayNum}`}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <div className="flex items-center gap-2">
+                                    {c.niche && (
+                                      <span className="text-[11px] px-2 py-0.5 rounded bg-[var(--panel-2)] text-[var(--muted)] border border-[var(--line-soft)]">
+                                        {c.niche} {c.subNiche ? `· ${c.subNiche}` : ""}
+                                      </span>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleEditConcept(c, idx);
+                                      }}
+                                      className="uyns-btn uyns-btn--ghost uyns-btn--sm py-0.5 px-2 text-[11px] hover:text-[var(--text)]"
+                                      title={isAr ? "تعديل عنوان وملخص الفكرة" : "Edit Title & Premise"}
+                                    >
+                                      <Edit3 className="w-3 h-3 text-[var(--accent)]" />
+                                      <span>{isAr ? "تعديل" : "Edit"}</span>
+                                    </button>
+                                    {isSelected && (
+                                      <span
+                                        className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full ${
+                                          isOriginal
+                                            ? "text-emerald-300 bg-emerald-500/20 border border-emerald-500/30"
+                                            : "text-amber-400 bg-amber-400/15"
+                                        }`}
+                                      >
+                                        {isOriginal
+                                          ? isAr ? "✓ فكرتك الأصلية المعتمدة" : "✓ Your Active Idea"
+                                          : isAr ? "✓ المقترح المختار" : "✓ Active Proposal"}
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <p className="text-xs text-[var(--muted)] mt-1.5 leading-relaxed">
+                                  {c.premise}
+                                </p>
+
+                                <div className="mt-3 pt-3 border-t border-[var(--line-soft)] grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                                  {c.mainHook && (
+                                    <div className="bg-[var(--panel-1)] p-2.5 rounded-lg border border-[var(--line-soft)]">
+                                      <strong className="text-amber-400 block mb-1">
+                                        {isAr ? "🪝 عنصر الجذب والخطاف (Hook):" : "🪝 Main Hook:"}
+                                      </strong>
+                                      <span className="text-[var(--text)] text-[11px] leading-relaxed">
+                                        {c.mainHook}
+                                      </span>
+                                    </div>
+                                  )}
+                                  {c.visualDirection && (
+                                    <div className="bg-[var(--panel-1)] p-2.5 rounded-lg border border-[var(--line-soft)]">
+                                      <strong className="text-[var(--accent)] block mb-1">
+                                        {isAr ? "🎨 الستايل البصري (Visual Style):" : "🎨 Visual Direction:"}
+                                      </strong>
+                                      <span className="text-[var(--text)] text-[11px] leading-relaxed">
+                                        {c.visualDirection}
+                                      </span>
+                                    </div>
+                                  )}
+                                  {c.payoff && (
+                                    <div className="bg-[var(--panel-1)] p-2.5 rounded-lg border border-[var(--line-soft)]">
+                                      <strong className="text-emerald-400 block mb-1">
+                                        {isAr ? "💡 الأثر والنتيجة (Payoff):" : "💡 Climax / Payoff:"}
+                                      </strong>
+                                      <span className="text-[var(--text)] text-[11px] leading-relaxed">
+                                        {c.payoff}
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-[var(--line-soft)]">
+                    <button
+                      type="button"
+                      onClick={() => goToStage(1)}
+                      className="uyns-btn uyns-btn--ghost cursor-pointer"
+                    >
+                      <ArrowLeft className="w-4 h-4" />
+                      <span>{isAr ? "السابق (تعديل الموضوع)" : "Back (Edit Topic)"}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleConfirmConceptToConfig}
+                      className="uyns-btn uyns-btn--primary cursor-pointer shadow-md py-2.5 px-6"
+                    >
+                      <span>{isAr ? "التالي: إعدادات الفيديو واختيار القناة ←" : "Next: Configure Video & Select Channel →"}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 2: REFERENCE / TOPIC STRATEGIC ANALYSIS REPORT */}
+              {conceptTab === "analysis" && (
+                <div className="mt-5 space-y-4">
+                  <div className="uyns-card space-y-4">
+                    <div className="flex items-center justify-between pb-3 border-b border-[var(--line-soft)]">
+                      <h2 className="text-sm font-bold text-[var(--text)] flex items-center gap-2">
+                        <FileText className="w-4 h-4 text-[var(--accent)]" />
+                        <span>
+                          {isAr
+                            ? narrative.reference?.mode === "topic"
+                              ? "تقرير التحليل الاستراتيجي لفكرة الموضوع"
+                              : "تقرير التحليل الاستراتيجي للمرجع"
+                            : "Strategic Reference Analysis"}
+                        </span>
+                      </h2>
+                      <span className="text-xs text-[var(--muted)]">
+                        {narrative.reference?.mode === "topic"
+                          ? (isAr ? "موضوع مباشر" : "Direct Topic Mode")
+                          : (isAr ? "فيديو يوتيوب مرجعي" : "YouTube Reference")}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs leading-relaxed">
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "الموضوع الرئيسي:" : "Main Topic:"}</strong>
+                        <span className="text-[var(--text)] font-semibold">{narrative.analysis?.mainTopic || "—"}</span>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "النيش والتصنيف الفرعي:" : "Niche & Sub-Niche:"}</strong>
+                        <span className="text-[var(--text)] font-semibold">
+                          {narrative.analysis?.niche || "—"} {narrative.analysis?.subNiche ? `· ${narrative.analysis.subNiche}` : ""}
+                        </span>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "الجمهور المستهدف:" : "Target Audience:"}</strong>
+                        <span className="text-[var(--text)]">{narrative.analysis?.targetAudience || "—"}</span>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "فجوة الفضول (Curiosity Gap):" : "Curiosity Gap:"}</strong>
+                        <span className="text-[var(--text)]">{narrative.analysis?.curiosityGap || "—"}</span>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "خطاف البداية (Opening Hook):" : "Opening Hook:"}</strong>
+                        <span className="text-[var(--text)]">{narrative.analysis?.openingHook || "—"}</span>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "نبرة السرد والإيقاع:" : "Narration Tone & Pacing:"}</strong>
+                        <span className="text-[var(--text)]">{narrative.analysis?.narrationTone || "—"}</span>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "الستايل البصري المستنتج:" : "Visual Style:"}</strong>
+                        <span className="text-[var(--text)]">{narrative.analysis?.visualStyle || "—"}</span>
+                      </div>
+
+                      <div className="p-3 rounded-lg bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-1.5">
+                        <strong className="text-[var(--muted)] block">{isAr ? "لوحة الألوان المتناغمة:" : "Color Palette:"}</strong>
+                        <span className="text-[var(--text)]">{narrative.analysis?.colorPalette || "—"}</span>
+                      </div>
+                    </div>
+
+                    {narrative.analysis?.engagementFactors?.length > 0 && (
+                      <div className="pt-3 border-t border-[var(--line-soft)]">
+                        <h3 className="text-xs font-bold text-[var(--text)] mb-2">
+                          {isAr ? "أسرار وعوامل الجذب العالية (High-Retention Elements):" : "High-Retention Factors:"}
+                        </h3>
+                        <div className="flex flex-wrap gap-2">
+                          {narrative.analysis.engagementFactors.map((ef, i) => (
+                            <span key={i} className="text-xs px-2.5 py-1 rounded-md bg-[var(--panel-2)] border border-[var(--line-soft)] text-emerald-400 font-medium">
+                              ✓ {ef}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="pt-4 flex justify-between items-center">
+                      <button
+                        type="button"
+                        onClick={() => setConceptTab("concepts")}
+                        className="uyns-btn uyns-btn--primary"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                        <span>{isAr ? "الاطلاع على الـ 5 أفكار المقترحة ←" : "View 5 Proposed Concepts →"}</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 3: VISUAL STYLE LOCK */}
+              {conceptTab === "styleLock" && (
                 <div className="mt-5 space-y-4">
                   <div className="flex items-center justify-between">
                     <div>
@@ -1646,136 +2476,16 @@ export default function NarrativeWorkspace({
                       </div>
                     ))}
                   </div>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 mt-5">
-                  {/* Left: Reference Analysis Report */}
-                  <div className="lg:col-span-5 space-y-4">
-                    <div className="uyns-card space-y-3">
-                      <h2 className="text-sm font-bold">
-                        {isAr ? "تقرير تحليل المرجع" : "Reference Analysis"}
-                      </h2>
-                      <ul className="space-y-2 text-xs leading-relaxed">
-                        <li>
-                          <strong className="text-[var(--muted)]">Main topic:</strong>{" "}
-                          {narrative.analysis?.mainTopic || "—"}
-                        </li>
-                        <li>
-                          <strong className="text-[var(--muted)]">Niche:</strong>{" "}
-                          {narrative.analysis?.niche || "—"} / {narrative.analysis?.subNiche || ""}
-                        </li>
-                        <li>
-                          <strong className="text-[var(--muted)]">Target audience:</strong>{" "}
-                          {narrative.analysis?.targetAudience || "—"}
-                        </li>
-                        <li>
-                          <strong className="text-[var(--muted)]">Curiosity gap:</strong>{" "}
-                          {narrative.analysis?.curiosityGap || "—"}
-                        </li>
-                        <li>
-                          <strong className="text-[var(--muted)]">Opening hook:</strong>{" "}
-                          {narrative.analysis?.openingHook || "—"}
-                        </li>
-                        <li>
-                          <strong className="text-[var(--muted)]">Style:</strong>{" "}
-                          {narrative.analysis?.visualStyle || "—"}
-                        </li>
-                        <li>
-                          <strong className="text-[var(--muted)]">Color palette:</strong>{" "}
-                          {narrative.analysis?.colorPalette || "—"}
-                        </li>
-                        <li>
-                          <strong className="text-[var(--muted)]">Tone & Pacing:</strong>{" "}
-                          {narrative.analysis?.narrationTone || "—"}
-                        </li>
-                      </ul>
 
-                      <div className="pt-2 border-t border-[var(--line-soft)]">
-                        <h3 className="text-xs font-bold mb-1.5">
-                          {isAr ? "عناصر الجذب الرئيسية:" : "Key Engagement Elements:"}
-                        </h3>
-                        <ul className="space-y-1 text-xs text-[var(--muted)]">
-                          {(narrative.analysis?.engagementFactors || []).map((ef, i) => (
-                            <li key={i}>✓ {ef}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Right: 5 Original Concepts */}
-                  <div className="lg:col-span-7 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <h2 className="text-sm font-bold">
-                        {isAr ? "5 أفكار أصلية مقترحة (اختر واحدة)" : "5 Original Concepts (Select One)"}
-                      </h2>
-                      <button
-                        type="button"
-                        disabled={!!busyMsg}
-                        onClick={handleRegenerateConcepts}
-                        className="uyns-btn uyns-btn--ghost uyns-btn--sm"
-                      >
-                        <RefreshCw className="w-3.5 h-3.5" />
-                        <span>{isAr ? "توليد أفكار أخرى" : "Regenerate 5 Concepts"}</span>
-                      </button>
-                    </div>
-
-                    <div className="space-y-2.5">
-                      {(narrative.concepts || []).map((c, idx) => {
-                        const isSelected = narrative.selectedConceptId === c.id;
-                        return (
-                          <div
-                            key={c.id || idx}
-                            onClick={() => handleSelectConcept(c)}
-                            className={`uyns-concept-card ${isSelected ? "is-selected" : ""}`}
-                          >
-                            <div className="uyns-concept-num">{idx + 1}</div>
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center justify-between gap-2">
-                                <h3 className="text-sm font-bold truncate">{c.title}</h3>
-                                <span className="text-[11px] text-[var(--muted)] shrink-0">
-                                  {c.niche} · {c.subNiche}
-                                </span>
-                              </div>
-                              <p className="text-xs text-[var(--muted)] mt-1 line-clamp-2">
-                                {c.premise}
-                              </p>
-                              {isSelected && (
-                                <div className="mt-2 pt-2 border-t border-[var(--line-soft)] text-[11px] space-y-1 text-[var(--text)]">
-                                  <div>
-                                    <strong>Hook:</strong> {c.mainHook}
-                                  </div>
-                                  <div>
-                                    <strong>Visual Direction:</strong> {c.visualDirection}
-                                  </div>
-                                  <div>
-                                    <strong>Payoff:</strong> {c.payoff}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    <div className="flex justify-between items-center pt-3">
-                      <button
-                        type="button"
-                        onClick={() => goToStage(1)}
-                        className="uyns-btn uyns-btn--ghost"
-                      >
-                        <ArrowLeft className="w-4 h-4" />
-                        <span>{isAr ? "السابق" : "Back"}</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleConfirmConceptToConfig}
-                        className="uyns-btn uyns-btn--primary"
-                      >
-                        <span>{isAr ? "التالي: إعدادات الفيديو ←" : "Next: Configure Video →"}</span>
-                      </button>
-                    </div>
+                  <div className="pt-4 flex justify-between items-center">
+                    <button
+                      type="button"
+                      onClick={() => setConceptTab("concepts")}
+                      className="uyns-btn uyns-btn--primary"
+                    >
+                      <Sparkles className="w-4 h-4" />
+                      <span>{isAr ? "العودة للأفكار المقترحة ←" : "Back to Concepts →"}</span>
+                    </button>
                   </div>
                 </div>
               )}
@@ -2389,6 +3099,119 @@ export default function NarrativeWorkspace({
                         {formatDurationClock(effectiveAudioSec)}
                       </span>
                     </div>
+
+                    {/* Manual Duration Override Input */}
+                    <div className="p-3.5 rounded-xl bg-[var(--panel-1)] border border-[var(--line-soft)] space-y-2">
+                      <label className="text-xs font-bold text-[var(--text)] flex items-center justify-between">
+                        <span>{isAr ? "تحديد أو تعديل مدة الفيديو يدوياً (اختياري):" : "Manual Duration Override (Optional):"}</span>
+                        <span className="text-[10px] text-[var(--accent)] bg-[var(--accent)]/10 px-2 py-0.5 rounded">
+                          {isAr ? "يتحكم بتوقيت المشاهد" : "Controls Scene Timings"}
+                        </span>
+                      </label>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          placeholder={isAr ? "مثال: 10:25 أو 12:30 أو 625 (ثانية)" : "e.g. 10:25, 12:30, or 625s"}
+                          value={narrative.manualDurationInput || ""}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            const parsed = parseDurationInput(val);
+                            updateNarrative((p) => {
+                              const nextScenes =
+                                parsed > 0 && p.scenes && p.scenes.length > 0
+                                  ? recalculateSceneTimings(p.scenes, parsed)
+                                  : p.scenes;
+                              return {
+                                ...p,
+                                manualDurationInput: val,
+                                actualDurationSec: parsed || p.actualDurationSec,
+                                scenes: nextScenes,
+                                outdated: {
+                                  ...p.outdated,
+                                  scenes: true,
+                                  imagePrompts: true,
+                                },
+                              };
+                            });
+                          }}
+                        />
+                        {narrative.manualDurationInput && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              updateNarrative((p) => {
+                                const fallbackSec =
+                                  audioDuration > 0
+                                    ? audioDuration
+                                    : (p.config?.targetDurationMinutes || 10) * 60;
+                                const nextScenes =
+                                  p.scenes && p.scenes.length > 0
+                                    ? recalculateSceneTimings(p.scenes, fallbackSec)
+                                    : p.scenes;
+                                return {
+                                  ...p,
+                                  manualDurationInput: "",
+                                  actualDurationSec: fallbackSec,
+                                  scenes: nextScenes,
+                                  outdated: { ...p.outdated, scenes: true, imagePrompts: true },
+                                };
+                              });
+                            }}
+                            className="uyns-btn uyns-btn--ghost uyns-btn--sm"
+                          >
+                            {isAr ? "إعادة ضبط" : "Clear"}
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Quick Presets for Precise Durations */}
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                        <span className="text-[11px] text-[var(--muted)]">
+                          {isAr ? "توقيتات سريعة:" : "Quick Presets:"}
+                        </span>
+                        {["10:25", "10:00", "08:30", "05:00"].map((preset) => {
+                          const pSec = parseDurationInput(preset);
+                          const isActive =
+                            narrative.manualDurationInput?.trim() === preset ||
+                            (!narrative.manualDurationInput &&
+                              Math.abs(effectiveAudioSec - pSec) < 0.5);
+                          return (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => {
+                                updateNarrative((p) => {
+                                  const nextScenes =
+                                    p.scenes && p.scenes.length > 0
+                                      ? recalculateSceneTimings(p.scenes, pSec)
+                                      : p.scenes;
+                                  return {
+                                    ...p,
+                                    manualDurationInput: preset,
+                                    actualDurationSec: pSec,
+                                    scenes: nextScenes,
+                                    outdated: { ...p.outdated, scenes: true, imagePrompts: true },
+                                  };
+                                });
+                              }}
+                              className={`uyns-btn uyns-btn--sm text-xs py-0.5 px-2 ${
+                                isActive
+                                  ? "uyns-btn--primary font-mono font-bold"
+                                  : "uyns-btn--ghost font-mono text-[var(--muted)]"
+                              }`}
+                            >
+                              {preset}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <p className="text-[10px] text-[var(--muted)]">
+                        {isAr
+                          ? "إذا أردت فرض مدة محددة للمشاهد وبرومبتات الصور (مثال 10:25)، اكتبها أو اخترها أعلاه وسيتم ضبط كل المشاهد بدقة فوراً."
+                          : "Enter or select an exact duration (e.g. 10:25) to strictly enforce scene timing and standalone image prompt timestamps."}
+                      </p>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -2426,9 +3249,9 @@ export default function NarrativeWorkspace({
                   </h1>
                   <p className="text-xs text-[var(--muted)]">
                     {(narrative.scenes || []).length} {isAr ? "مشهد بمدد متفاوتة طبيعية حسب السكريبت" : "scenes with natural script-driven durations"} ·{" "}
-                    {isAr ? "المدة الإجمالية:" : "Total Duration:"}{" "}
+                    {isAr ? "المدة المستهدفة للصوت:" : "Target Audio Duration:"}{" "}
                     <span className="font-mono text-[var(--accent)] font-bold">
-                      {formatDurationClock(narrative.actualDurationSec || effectiveAudioSec)}
+                      {formatDurationClock(effectiveAudioSec)}
                     </span>
                   </p>
                 </div>
@@ -2437,7 +3260,7 @@ export default function NarrativeWorkspace({
                   <button
                     type="button"
                     disabled={!!busyMsg}
-                    onClick={handleRegenerateScenes}
+                    onClick={() => handleRegenerateScenes()}
                     className="uyns-btn uyns-btn--primary uyns-btn--sm"
                   >
                     <Sparkles className="w-3.5 h-3.5" />
@@ -2451,6 +3274,79 @@ export default function NarrativeWorkspace({
                         : "Regenerate Dynamic Scenes"}
                     </span>
                   </button>
+                </div>
+              </div>
+
+              {/* Timing Synchronization & Scene Pacing Control Bar */}
+              <div className="mb-4 p-3.5 rounded-xl bg-[var(--panel-2)] border border-[var(--line-soft)] space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[var(--muted)]">{isAr ? "مدة الصوت المعتمدة:" : "Target Audio Duration:"}</span>
+                    <span className="font-mono font-bold text-[var(--accent)] text-sm px-2 py-0.5 rounded bg-[var(--accent)]/10 border border-[var(--accent)]/20">
+                      {formatDurationClock(effectiveAudioSec)} ({effectiveAudioSec}s)
+                    </span>
+                    {isDurationSynced ? (
+                      <span className="px-2 py-0.5 rounded bg-[rgba(0,245,155,0.12)] text-[var(--accent)] text-[11px] font-bold">
+                        {isAr ? "✓ المشاهد متزامنة بدقة مع الصوت" : "✓ Scenes Strictly Synced"}
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 text-[11px] font-bold">
+                        {isAr
+                          ? `⚠️ المشاهد تنتهي عند ${formatDurationClock(scenesEnd)}`
+                          : `⚠️ Scenes end at ${formatDurationClock(scenesEnd)}`}
+                      </span>
+                    )}
+                  </div>
+
+                  {!isDurationSynced && (narrative.scenes || []).length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleAutoSyncSceneTimings}
+                      className="uyns-btn uyns-btn--sm bg-[var(--accent)] text-black font-bold hover:brightness-110"
+                    >
+                      <Clock className="w-3.5 h-3.5" />
+                      <span>
+                        {isAr
+                          ? `ضبط المشاهد فوراً لمطابقة ${formatDurationClock(effectiveAudioSec)}`
+                          : `Auto-Sync Scenes to ${formatDurationClock(effectiveAudioSec)}`}
+                      </span>
+                    </button>
+                  )}
+                </div>
+
+                {/* Pacing Preset Buttons */}
+                <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-[var(--line-soft)]">
+                  <span className="text-[11px] text-[var(--muted)]">
+                    {isAr ? "سرعة المشاهد وتعدادها المتوقع:" : "Scene Pacing & Estimated Count:"}
+                  </span>
+                  {[
+                    { labelAr: "سريع (~6 ث)", labelEn: "Fast (~6s)", pace: 6 },
+                    { labelAr: "متوازن (~10 ث)", labelEn: "Balanced (~10s)", pace: 10 },
+                    { labelAr: "سينمائي (~15 ث)", labelEn: "Cinematic (~15s)", pace: 15 },
+                    { labelAr: "سردي هادئ (~20 ث)", labelEn: "Narrative (~20s)", pace: 20 },
+                  ].map((item) => {
+                    const isSel = scenePaceSec === item.pace;
+                    const count = Math.max(4, Math.round(effectiveAudioSec / item.pace));
+                    return (
+                      <button
+                        key={item.pace}
+                        type="button"
+                        onClick={() => {
+                          setScenePaceSec(item.pace);
+                          handleRegenerateScenes(item.pace);
+                        }}
+                        disabled={!!busyMsg}
+                        className={`uyns-btn uyns-btn--sm text-xs py-1 px-2.5 ${
+                          isSel ? "uyns-btn--primary font-bold" : "uyns-btn--ghost text-[var(--muted)]"
+                        }`}
+                      >
+                        <span>{isAr ? item.labelAr : item.labelEn}</span>
+                        <span className="font-mono text-[10px] opacity-75">
+                          (~{count} {isAr ? "مشهد" : "scenes"})
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -2624,9 +3520,12 @@ export default function NarrativeWorkspace({
                       : "Standalone Scene Image Prompts"}
                   </h1>
                   <p className="text-xs text-[var(--muted)] mt-0.5">
-                    {isAr
-                      ? `مُولدة حسب السكريبت المعتمد وإعدادات قناة "${activeChannel?.name || ""}" (${activeChannel?.aspectRatio || "16:9"})`
-                      : `Generated from your approved script and "${activeChannel?.name || "Channel"}" settings (${activeChannel?.aspectRatio || "16:9"})`}
+                    {(narrative.imagePrompts || []).length} {isAr ? "برومبت مستقل" : "standalone prompts"} ·{" "}
+                    {isAr ? "المدة المستهدفة للصوت:" : "Target Audio Duration:"}{" "}
+                    <span className="font-mono text-[var(--accent)] font-bold">
+                      {formatDurationClock(effectiveAudioSec)}
+                    </span>
+                    {" "}· {isAr ? `قناة "${activeChannel?.name || ""}" (${activeChannel?.aspectRatio || "16:9"})` : `Channel "${activeChannel?.name || "Channel"}" (${activeChannel?.aspectRatio || "16:9"})`}
                   </p>
                 </div>
 

@@ -5,7 +5,7 @@ import { transitionOf } from "../lib/transitions";
 import { applyEffect } from "../lib/effects";
 import { preloadSfx, fireSfx, stopAllSfx, resumeSfx } from "../lib/sfxScheduler";
 import AudioPanel from "./panels/AudioPanel";
-import { captionAt, captionCueAt, drawCaption, captionFontPx, captionFontFamily } from "../lib/captions";
+import { captionAt, captionCueAt, drawCaption, captionFontPx, captionFontFamily, drawCaptionOverlay } from "../lib/captions";
 import { tc, clock } from "../lib/format";
 import ExportPanel from "./panels/ExportPanel";
 import TransitionsPanel from "./panels/TransitionsPanel";
@@ -40,6 +40,8 @@ export default function Editor({
   captionSize, setCaptionSize, captionLineHeight, setCaptionLineHeight,
   captionFontScale, setCaptionFontScale,
   captionFont, setCaptionFont, captionPosition, setCaptionPosition,
+  captionEffects = [], setCaptionEffects,
+  captionEffectsOn = true, setCaptionEffectsOn,
   captionName, captionError, onCaptionFile,
   activeTab, onTabChange,
 }) {
@@ -57,6 +59,7 @@ export default function Editor({
   const [playing, setPlaying] = useState(false);
   const [elapsed, setElapsed] = useState(0); // seconds spent in the current render
   const [selectedCut, setSelectedCut] = useState(null); // selected clip name (drives transition)
+  const [selectedOverlayId, setSelectedOverlayId] = useState(null); // selected AI text effect overlay
   const [currentType, setCurrentType] = useState("fade");
   const [inspect, setInspect] = useState(null);   // slot name open in the inspector
   const [dismissedWarn, setDismissedWarn] = useState(() => new Set()); // hidden warning texts
@@ -70,12 +73,20 @@ export default function Editor({
   }, []);
 
   // Draggable left panel: the right column is fixed (320px); dragging the divider
-  // resizes the left panel (≤ 30% of the editor) and the preview (≤ 60%). Persisted.
+  // resizes the left panel and the preview. Persisted.
   const editorRef = useRef(null);
   const [leftW, setLeftW] = useState(() => {
-    try { const v = +localStorage.getItem("ae-leftw"); if (v > 0) return v; } catch { /* ignore */ }
-    return 340;
+    try { const v = +localStorage.getItem("ae-leftw"); if (v >= 360) return v; } catch { /* ignore */ }
+    return 460;
   });
+  const [panelExpanded, setPanelExpanded] = useState(false);
+  const togglePanelExpand = useCallback(() => {
+    setPanelExpanded((prev) => {
+      const next = !prev;
+      setLeftW(next ? 580 : 440);
+      return next;
+    });
+  }, []);
   const draggingRef = useRef(false);
   useEffect(() => { try { localStorage.setItem("ae-leftw", String(Math.round(leftW))); } catch { /* ignore */ } }, [leftW]);
   const onResizeDown = useCallback((e) => {
@@ -87,12 +98,10 @@ export default function Editor({
     if (!draggingRef.current || !editorRef.current) return;
     const r = editorRef.current.getBoundingClientRect();
     const editorW = r.width;
-    const rightPx = 320, gaps = 24; // fixed right column + two 12px grid gaps
-    const leftMax = 0.30 * editorW;                       // left ≤ 30%
-    const leftMin = Math.max(240, 0.40 * editorW - rightPx - gaps); // keeps preview ≤ 60%
-    const lo = Math.min(leftMin, leftMax);
+    const leftMax = Math.min(720, Math.max(480, 0.48 * editorW));
+    const leftMin = 360;
     let x = e.clientX - r.left;
-    x = Math.max(lo, Math.min(leftMax, x));
+    x = Math.max(leftMin, Math.min(leftMax, x));
     setLeftW(x);
   }, []);
   const onResizeUp = useCallback((e) => {
@@ -261,6 +270,20 @@ export default function Editor({
       }
     }
 
+    // Render AI Auto Caption Effects Overlays with Smart Scene Context
+    if (captionEffectsOn !== false && captionEffects && captionEffects.length) {
+      const capFamily = captionFontFamily(captionFont);
+      const activeClip = clips.find((c) => t >= c.start && t < c.start + c.duration) || clips[0];
+      const activeImg = activeClip ? imageEls[activeClip.name] : null;
+      const sceneCtx = { activeImg, aspect, clipName: activeClip?.name };
+
+      for (const ov of captionEffects) {
+        if (ov.approved !== false && t >= ov.start && t < ov.end) {
+          drawCaptionOverlay(ctx, ov, W, H, t, capFamily, sceneCtx);
+        }
+      }
+    }
+
     // Scene fades (opening / ending).
     if (fadeIn > 0 && t < fadeIn) {
       ctx.globalAlpha = Math.max(0, 1 - t / fadeIn);
@@ -274,7 +297,7 @@ export default function Editor({
   }, [clips, imageEls, transitionsByName, transitionDuration, motionByName, motionAmount,
       fadeIn, fadeOut, effectId, effectIntensity, effectByName, duration, exportDuration, playing, videoInfoByName, videoParams, volumeByName,
       captionsOn, captionCues, captionStyle, captionColor, captionAnimation, captionSize, captionLineHeight, captionFontScale,
-      captionFont, captionPosition]);
+      captionFont, captionPosition, captionEffects, captionEffectsOn]);
 
   useEffect(() => { drawRef.current = draw; }, [draw]);
   useEffect(() => { timeRef.current = time; }, [time]);
@@ -476,6 +499,12 @@ export default function Editor({
                 captionFontScale={captionFontScale} setCaptionFontScale={setCaptionFontScale}
                 captionFont={captionFont} setCaptionFont={setCaptionFont}
                 captionPosition={captionPosition} setCaptionPosition={setCaptionPosition}
+                captionEffects={captionEffects} setCaptionEffects={setCaptionEffects}
+                captionEffectsOn={captionEffectsOn} setCaptionEffectsOn={setCaptionEffectsOn}
+                onSeek={seek}
+                currentTime={time}
+                selectedOverlayId={selectedOverlayId}
+                setSelectedOverlayId={setSelectedOverlayId}
                 captionName={captionName} captionError={captionError} onCaptionFile={onCaptionFile}
               />
             ) },
@@ -525,6 +554,8 @@ export default function Editor({
           ]}
           activeTab={activeTab}
           onTabChange={onTabChange}
+          isExpanded={panelExpanded}
+          onToggleExpand={togglePanelExpand}
         />
         <div
           className="editor2__resizer"
@@ -665,6 +696,25 @@ export default function Editor({
           onResizeBoundary={resizeBoundary}
           trimEnd={trimEnd}
           onTrimChange={setTrimEnd}
+          captionEffects={captionEffects}
+          captionEffectsOn={captionEffectsOn}
+          selectedOverlayId={selectedOverlayId}
+          onOverlaySelect={(id) => {
+            setSelectedOverlayId(id);
+            if (onTabChange) onTabChange("captions");
+          }}
+          onOverlayMove={(id, newStart) => {
+            if (!setCaptionEffects) return;
+            setCaptionEffects((prev) => {
+              return (prev || []).map((ov) => {
+                if (ov.id !== id) return ov;
+                const dur = Math.max(0.4, (ov.end || ov.start + 1.5) - ov.start);
+                const clampedStart = Math.max(0, Math.min(exportDuration - dur, +newStart.toFixed(2)));
+                const clampedEnd = Math.max(clampedStart + 0.3, +(clampedStart + dur).toFixed(2));
+                return { ...ov, start: clampedStart, end: clampedEnd };
+              });
+            });
+          }}
           sfx={sfx} onSfxAdd={addSfx} onSfxMove={moveSfx} onSfxOpen={setSfxEdit}
         />
       </div>

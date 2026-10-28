@@ -1200,6 +1200,7 @@ button, input, select, textarea {
 }
 .tl__tag--audio { color: var(--cyan); }
 .tl__tag--fx { color: var(--magenta); }
+.tl__tag--txt { color: var(--accent); }
 
 .tl__ruler {
   flex: 1;
@@ -1299,6 +1300,67 @@ button, input, select, textarea {
   height: 24px;
   background: rgba(255, 46, 147, 0.05);
   cursor: pointer;
+  border-bottom: 1px solid var(--line-soft);
+}
+.tl__lane--text-effects {
+  height: 28px;
+  background: rgba(0, 245, 155, 0.05);
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+.tl__lane--text-effects.is-disabled {
+  opacity: 0.45;
+}
+
+.tl__ov-block {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  min-width: 24px;
+  border-radius: 6px;
+  background: rgba(18, 24, 38, 0.94);
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  cursor: grab;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  overflow: hidden;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  transition: transform 0.1s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  z-index: 4;
+}
+.tl__ov-block:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.3);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.6);
+}
+.tl__ov-block.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 10px var(--accent-glow);
+}
+.tl__ov-block.is-unapproved {
+  opacity: 0.45;
+  filter: grayscale(0.5);
+  border-style: dashed;
+}
+.tl__ov-cat {
+  font-size: 8.5px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+.tl__ov-text {
+  font-size: 10px;
+  font-weight: 800;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Clips on Timeline Track */

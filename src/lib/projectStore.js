@@ -67,14 +67,70 @@ export async function storageEstimate() {
   return { usage: 0, quota: 0 };
 }
 
+// ---- Cloud SQL Online Sync Helpers ------------------------------------------
+
+async function fetchApi(path, options = {}) {
+  try {
+    const res = await fetch(path, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function checkCloudDatabaseStatus() {
+  return await fetchApi("/api/db/status");
+}
+
 // ---- projects --------------------------------------------------------------
 
 export function newId() {
   return "p_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
 
-// Metadata for the projects grid — never pulls media blobs, so it's fast.
+// Metadata for the projects grid — pulls from online Cloud SQL with IndexedDB cache fallback.
 export async function listProjects() {
+  // 1. Try fetching from online Cloud SQL database
+  try {
+    const remote = await fetchApi("/api/db/projects");
+    if (Array.isArray(remote)) {
+      // Background update to local IndexedDB cache
+      tx(STORE_PROJECTS, "readwrite", (s) => {
+        for (const p of remote) {
+          s.put(p);
+        }
+      }).catch(() => {});
+
+      return remote
+        .map((p) => {
+          const np = p.data && p.data.narrative;
+          return {
+            id: p.id,
+            name: p.name,
+            createdAt: p.createdAt,
+            updatedAt: p.updatedAt,
+            thumb: p.thumb || (np && np.reference && np.reference.thumbnailUrl) || null,
+            durationSec: p.durationSec || (np && np.actualDurationSec) || (np && np.config && np.config.targetDurationMinutes ? np.config.targetDurationMinutes * 60 : 0),
+            clipCount: p.clipCount || (np && np.scenes ? np.scenes.length : 0),
+            niche: p.niche || (np && np.selectedConcept && np.selectedConcept.niche) || (np && np.analysis && np.analysis.niche) || "Documentary",
+            currentStage: p.currentStage || (np && np.currentStage) || 1,
+            progressPct: p.progressPct != null ? p.progressPct : (np && np.progressPct != null ? np.progressPct : 0),
+            status: p.status || (np && np.status) || "Draft",
+            archived: !!p.archived,
+          };
+        })
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    }
+  } catch (_) {}
+
+  // 2. Offline / local fallback
   const all = await tx(STORE_PROJECTS, "readonly", (s) => reqP(s.getAll()));
   return (all || [])
     .map((p) => {
@@ -98,20 +154,47 @@ export async function listProjects() {
 }
 
 export async function getProject(id) {
+  // 1. Try fetching full project data from Cloud SQL
+  try {
+    const remote = await fetchApi(`/api/db/projects/${id}`);
+    if (remote && remote.id) {
+      tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(remote))).catch(() => {});
+      return remote;
+    }
+  } catch (_) {}
+
+  // 2. Fallback to local IndexedDB
   return tx(STORE_PROJECTS, "readonly", (s) => reqP(s.get(id)));
 }
 
 export async function saveProject(record) {
   const rec = { ...record, updatedAt: Date.now() };
+  // Save locally in IndexedDB first
   await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(rec)));
+
+  // Sync to Cloud SQL online database
+  fetchApi("/api/db/projects", {
+    method: "POST",
+    body: JSON.stringify(rec),
+  }).catch((err) => {
+    console.warn("[Cloud SQL Sync] Could not save project online:", err);
+  });
+
   return rec;
 }
 
 export async function renameProject(id, name) {
   const rec = await getProject(id);
   if (!rec) return null;
-  rec.name = name; rec.updatedAt = Date.now();
+  rec.name = name;
+  rec.updatedAt = Date.now();
   await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(rec)));
+
+  fetchApi(`/api/db/projects/${id}/rename`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  }).catch(() => {});
+
   return rec;
 }
 
@@ -121,6 +204,12 @@ export async function archiveProject(id, archived = true) {
   rec.archived = !!archived;
   rec.updatedAt = Date.now();
   await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(rec)));
+
+  fetchApi(`/api/db/projects/${id}/archive`, {
+    method: "PATCH",
+    body: JSON.stringify({ archived }),
+  }).catch(() => {});
+
   return rec;
 }
 
@@ -136,7 +225,12 @@ export async function duplicateProject(id) {
   cloned.updatedAt = now;
   await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.put(cloned)));
 
-  // Copy all media blobs from original project to the duplicate
+  // Duplicate in Cloud SQL online database
+  fetchApi(`/api/db/projects/${id}/duplicate`, {
+    method: "POST",
+  }).catch(() => {});
+
+  // Copy all media blobs from original project to duplicate
   try {
     const mediaIds = await listMediaIds(id);
     for (const mid of mediaIds) {
@@ -151,6 +245,10 @@ export async function duplicateProject(id) {
 export async function deleteProject(id) {
   await deleteProjectMedia(id);
   await tx(STORE_PROJECTS, "readwrite", (s) => reqP(s.delete(id)));
+
+  fetchApi(`/api/db/projects/${id}`, {
+    method: "DELETE",
+  }).catch(() => {});
 }
 
 // ---- media -----------------------------------------------------------------
@@ -199,6 +297,16 @@ export async function syncMedia(projectId, wanted) {
 // ---- global production settings --------------------------------------------
 
 export async function getGlobalSettings() {
+  // 1. Try remote Cloud SQL
+  try {
+    const remote = await fetchApi("/api/db/settings");
+    if (remote && typeof remote === "object" && Object.keys(remote).length > 0) {
+      tx(STORE_SETTINGS, "readwrite", (s) => reqP(s.put(remote, "production_settings"))).catch(() => {});
+      return remote;
+    }
+  } catch (_) {}
+
+  // 2. Local fallback
   try {
     return await tx(STORE_SETTINGS, "readonly", (s) => reqP(s.get("production_settings")));
   } catch (_) {
@@ -209,8 +317,12 @@ export async function getGlobalSettings() {
 export async function saveGlobalSettings(settings) {
   try {
     await tx(STORE_SETTINGS, "readwrite", (s) => reqP(s.put(settings, "production_settings")));
-    return settings;
-  } catch (_) {
-    return settings;
-  }
+  } catch (_) {}
+
+  fetchApi("/api/db/settings", {
+    method: "POST",
+    body: JSON.stringify(settings),
+  }).catch(() => {});
+
+  return settings;
 }
